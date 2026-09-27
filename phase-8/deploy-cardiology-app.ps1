@@ -143,7 +143,6 @@ Write-Host "  ✓ Infrastructure ready (registry $acrName)" -ForegroundColor Gre
 # An existing cardiology revision must never be served without sign-in. If the
 # app runs the real image but its auth config is not enforcing (an earlier run
 # failed part-way), take it offline before any other work.
-$quarantined = $false
 if ($hasRegistryImage) {
     $authShow = Invoke-Az @("containerapp", "auth", "show", "-g", $ResourceGroupName, "-n", $appName, "-o", "json") -AllowFailure
     $enforcing = $false
@@ -157,7 +156,6 @@ if ($hasRegistryImage) {
         foreach ($revisionName in $activeRevisions) {
             Invoke-Az @("containerapp", "revision", "deactivate", "-g", $ResourceGroupName, "-n", $appName, "--revision", $revisionName, "-o", "none") | Out-Null
         }
-        $quarantined = $true
         Write-Host "  ! $appName was serving without sign-in; its revisions are offline until sign-in is enforced" -ForegroundColor Yellow
     }
 }
