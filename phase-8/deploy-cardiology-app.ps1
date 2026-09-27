@@ -193,86 +193,12 @@ if ((Invoke-Az @("group", "exists", "-n", $ResourceGroupName)).Out.Trim() -ne "t
     Write-Host "  ✓ Created resource group $ResourceGroupName" -ForegroundColor Green
 }
 
-# ── Source checkout ──────────────────────────────────────────────────────────
-if (-not $CardiologyAppPath) { $CardiologyAppPath = Join-Path (Split-Path -Parent $RepoRoot) "caldova-cardio-e2e" }
-if (-not (Test-Path (Join-Path $CardiologyAppPath ".git"))) {
-    Write-Host "  Cloning $AppRepo to $CardiologyAppPath" -ForegroundColor Gray
-    $cloned = $false
-    if (Get-Command gh -ErrorAction SilentlyContinue) {
-        & gh repo clone $AppRepo $CardiologyAppPath -- --branch $AppBranch
-        $cloned = $LASTEXITCODE -eq 0
-    }
-    if (-not $cloned) {
-        & git clone --branch $AppBranch "https://github.com/$AppRepo.git" $CardiologyAppPath
-        if ($LASTEXITCODE -ne 0) { throw "Could not clone $AppRepo. Sign in with 'gh auth login' as an account with access." }
-    }
-}
-if (-not (Test-Path (Join-Path $CardiologyAppPath "Dockerfile"))) {
-    throw "$CardiologyAppPath has no root Dockerfile; check out $AppBranch of $AppRepo."
-}
-$sha = (& git -C $CardiologyAppPath rev-parse --short=12 HEAD).Trim()
-if ($LASTEXITCODE -ne 0 -or -not $sha) { throw "Could not read the checkout's commit." }
-$dirty = & git -C $CardiologyAppPath status --porcelain
-$tag = if ($dirty) { "$sha-dirty-$(Get-Date -Format 'yyyyMMddHHmmss')" } else { $sha }
-Write-Host "  ✓ Source $CardiologyAppPath @ $tag" -ForegroundColor Green
-
-# ── Infrastructure (placeholder image until the registry holds a build) ──────
+# ── Existing app ─────────────────────────────────────────────────────────────
 $appName = "$Prefix-app"
 $current = Invoke-Az @("containerapp", "show", "-g", $ResourceGroupName, "-n", $appName,
     "--query", "properties.template.containers[0].image", "-o", "tsv") -AllowFailure
 $hasRegistryImage = $current.Code -eq 0 -and $current.Out -match "\.azurecr\.io/${ImageRepo}:"
 $acrQuery = '[?tags."hls-workload"==''cardiology-app''].name | [0]'
-
-# ── Chat model ───────────────────────────────────────────────────────────────
-# DataZoneStandard keeps inference in the US data zone. Its quota is counted
-# across the whole zone (every US region reports the same usage), so another
-# region adds no capacity. An environment keeps the model it already runs; a new
-# one gets the first candidate the zone can still hold, sized to fit.
-$modelCandidates = @(
-    @{ Name = "gpt-5.6-luna"; Version = "2026-07-09" },
-    @{ Name = "gpt-5.5"; Version = "2026-04-24" }
-)
-$wantedCapacity = 100; $minimumCapacity = 50
-$chat = $null
-$aiName = (Invoke-Az @("cognitiveservices", "account", "list", "-g", $ResourceGroupName, "--query", $acrQuery, "-o", "tsv")).Out.Trim()
-if ($aiName) {
-    $existingModels = @((Invoke-Az @("cognitiveservices", "account", "deployment", "list", "-g", $ResourceGroupName, "-n", $aiName, "-o", "json")).Out | ConvertFrom-Json | ForEach-Object { $_ })
-    foreach ($candidate in $modelCandidates) {
-        $found = @($existingModels | Where-Object { $_.name -eq $candidate.Name -and $_.sku.name -eq "DataZoneStandard" }) | Select-Object -First 1
-        if ($found) {
-            $chat = @{ Name = $found.name; Version = $found.properties.model.version; Capacity = [int]$found.sku.capacity }
-            Write-Host "  = Keeping this environment's model $($chat.Name)" -ForegroundColor Gray
-            break
-        }
-    }
-}
-if (-not $chat) {
-    $usage = @((Invoke-Az @("cognitiveservices", "usage", "list", "-l", $Location, "-o", "json")).Out | ConvertFrom-Json | ForEach-Object { $_ })
-    $offered = @((Invoke-Az @("cognitiveservices", "model", "list", "-l", $Location, "-o", "json")).Out | ConvertFrom-Json | ForEach-Object { $_ })
-    foreach ($candidate in $modelCandidates) {
-        $isOffered = @($offered | Where-Object { (Get-Prop $_.model "name") -eq $candidate.Name -and (Get-Prop $_.model "version") -eq $candidate.Version -and
-            @(Get-Prop $_.model "skus" | ForEach-Object { Get-Prop $_ "name" }) -contains "DataZoneStandard" }).Count -gt 0
-        $quota = @($usage | Where-Object { $_.name.value -eq "OpenAI.DataZoneStandard.$($candidate.Name)" }) | Select-Object -First 1
-        if (-not $isOffered -or -not $quota) { Write-Host "  = $($candidate.Name) DataZoneStandard is not offered in $Location" -ForegroundColor Gray; continue }
-        $free = [int][Math]::Floor([double]$quota.limit - [double]$quota.currentValue)
-        if ([Math]::Min($wantedCapacity, $free) -ge $minimumCapacity) {
-            $chat = @{ Name = $candidate.Name; Version = $candidate.Version; Capacity = [Math]::Min($wantedCapacity, $free) }
-            break
-        }
-        Write-Host "  = $($candidate.Name): only $free of its US data-zone quota is free" -ForegroundColor Gray
-    }
-    if (-not $chat) { throw "No chat model fits the free US data-zone quota (need $minimumCapacity); free capacity or request more quota." }
-}
-Write-Host "  ✓ Model $($chat.Name) $($chat.Version), DataZoneStandard capacity $($chat.Capacity)" -ForegroundColor Green
-if ($hasRegistryImage) {
-    Write-Host "  = $appName already runs a registry image; building the new revision directly" -ForegroundColor Gray
-} else {
-    Write-Host "  Deploying infrastructure (placeholder image)..." -ForegroundColor Gray
-    Deploy-Template -Image "mcr.microsoft.com/k8se/quickstart:latest" -UseRegistry $false -Revision "placeholder" -PrincipalId $deployerId | Out-Null
-}
-$acrName = (Invoke-Az @("acr", "list", "-g", $ResourceGroupName, "--query", $acrQuery, "-o", "tsv")).Out.Trim()
-if (-not $acrName) { throw "The cardiology app registry was not found in $ResourceGroupName." }
-Write-Host "  ✓ Infrastructure ready (registry $acrName)" -ForegroundColor Green
 
 function Get-AppIngress {
     return (Invoke-Az @("containerapp", "show", "-g", $ResourceGroupName, "-n", $appName, "--query", "properties.configuration.ingress", "-o", "json")).Out | ConvertFrom-Json
@@ -288,20 +214,26 @@ function Stop-AppRevisions {
 # ── Identity facts the access checks compare against ────────────────────────
 # The external FQDN is <app>.<environment domain>, known before ingress turns
 # external, so the callback can be registered first. Assignees are exactly the
-# deploying user plus -CardiologyAppUsers.
-$envDomain = (Invoke-Az @("containerapp", "env", "show", "-g", $ResourceGroupName, "-n", "$Prefix-cae",
-    "--query", "properties.defaultDomain", "-o", "tsv")).Out.Trim()
-if (-not $envDomain) { throw "The Container Apps environment $Prefix-cae has no default domain." }
-$fqdn = "$appName.$envDomain"
-$appUrl = "https://$fqdn"
-$redirect = "$appUrl/.auth/login/aad/callback"
+# deploying user plus -CardiologyAppUsers; an unknown user is an error, never
+# silently dropped from the allowlist.
+function Resolve-IdentityFacts {
+    $domain = (Invoke-Az @("containerapp", "env", "show", "-g", $ResourceGroupName, "-n", "$Prefix-cae",
+        "--query", "properties.defaultDomain", "-o", "tsv")).Out.Trim()
+    if (-not $domain) { throw "The Container Apps environment $Prefix-cae has no default domain." }
+    $script:envDomain = $domain
+    $script:fqdn = "$appName.$domain"
+    $script:appUrl = "https://$($script:fqdn)"
+    $script:redirect = "$($script:appUrl)/.auth/login/aad/callback"
+    $users = @($deployerId)
+    foreach ($upn in $CardiologyAppUsers | Where-Object { $_ }) {
+        $id = (Invoke-Az @("ad", "user", "show", "--id", $upn, "--query", "id", "-o", "tsv")).Out.Trim()
+        if (-not $id) { throw "Requested sign-in user $upn was not found." }
+        $users += $id
+    }
+    $script:allowed = @($users | Select-Object -Unique)
+}
 $displayName = "cardiology-app-$ResourceGroupName"
 $ownerTag = "hls-cardiology-app:$($account.id)/$($ResourceGroupName.ToLowerInvariant())/$appName"
-$allowed = @($deployerId)
-foreach ($upn in $CardiologyAppUsers | Where-Object { $_ }) {
-    $allowed += (Invoke-Az @("ad", "user", "show", "--id", $upn, "--query", "id", "-o", "tsv")).Out.Trim()
-}
-$allowed = @($allowed | Select-Object -Unique)
 
 # A list query, so an empty result positively means "no service principal" and
 # a failed lookup throws (fail closed) rather than reading as absent.
@@ -359,7 +291,9 @@ function Get-RegistrationProblem([string]$ClientId, [switch]$AssigneesAtMost) {
     return ""
 }
 
-# An existing cardiology revision must never be served under a weaker policy. If
+# An existing cardiology revision must never be served under a weaker policy.
+# This runs before any other work (source, model, infrastructure), so nothing
+# that fails earlier can leave a weakened app online. If
 # the app runs the real image and its access state is not the intended one (the
 # auth config and ingress, Get-AccessPolicyProblem; the registration, its service
 # principal, and assignees, Get-RegistrationProblem), or cannot be read, take it
@@ -367,6 +301,7 @@ function Get-RegistrationProblem([string]$ClientId, [switch]$AssigneesAtMost) {
 # someone may have loosened it. The registration itself is not edited here.
 if ($hasRegistryImage) {
     try {
+        Resolve-IdentityFacts  # inside the boundary: a failed lookup quarantines too
         $currentAuth = (Invoke-Az @("containerapp", "auth", "show", "-g", $ResourceGroupName, "-n", $appName, "-o", "json")).Out | ConvertFrom-Json
         $weakness = Get-AccessPolicyProblem $currentAuth (Get-AppIngress)
         if (-not $weakness) {
@@ -378,6 +313,85 @@ if ($hasRegistryImage) {
         Write-Host "  ! $appName was not enforcing the intended sign-in policy ($weakness); its revisions are offline until it is" -ForegroundColor Yellow
     }
 }
+# ── Source checkout ──────────────────────────────────────────────────────────
+if (-not $CardiologyAppPath) { $CardiologyAppPath = Join-Path (Split-Path -Parent $RepoRoot) "caldova-cardio-e2e" }
+if (-not (Test-Path (Join-Path $CardiologyAppPath ".git"))) {
+    Write-Host "  Cloning $AppRepo to $CardiologyAppPath" -ForegroundColor Gray
+    $cloned = $false
+    if (Get-Command gh -ErrorAction SilentlyContinue) {
+        & gh repo clone $AppRepo $CardiologyAppPath -- --branch $AppBranch
+        $cloned = $LASTEXITCODE -eq 0
+    }
+    if (-not $cloned) {
+        & git clone --branch $AppBranch "https://github.com/$AppRepo.git" $CardiologyAppPath
+        if ($LASTEXITCODE -ne 0) { throw "Could not clone $AppRepo. Sign in with 'gh auth login' as an account with access." }
+    }
+}
+if (-not (Test-Path (Join-Path $CardiologyAppPath "Dockerfile"))) {
+    throw "$CardiologyAppPath has no root Dockerfile; check out $AppBranch of $AppRepo."
+}
+$sha = (& git -C $CardiologyAppPath rev-parse --short=12 HEAD).Trim()
+if ($LASTEXITCODE -ne 0 -or -not $sha) { throw "Could not read the checkout's commit." }
+$dirty = & git -C $CardiologyAppPath status --porcelain
+$tag = if ($dirty) { "$sha-dirty-$(Get-Date -Format 'yyyyMMddHHmmss')" } else { $sha }
+Write-Host "  ✓ Source $CardiologyAppPath @ $tag" -ForegroundColor Green
+
+# ── Chat model ───────────────────────────────────────────────────────────────
+# DataZoneStandard keeps inference in the US data zone. Its quota is counted
+# across the whole zone (every US region reports the same usage), so another
+# region adds no capacity. An environment keeps the model it already runs; a new
+# one gets the first candidate the zone can still hold, sized to fit.
+$modelCandidates = @(
+    @{ Name = "gpt-5.6-luna"; Version = "2026-07-09" },
+    @{ Name = "gpt-5.5"; Version = "2026-04-24" }
+)
+$wantedCapacity = 100; $minimumCapacity = 50
+$chat = $null
+$aiName = (Invoke-Az @("cognitiveservices", "account", "list", "-g", $ResourceGroupName, "--query", $acrQuery, "-o", "tsv")).Out.Trim()
+if ($aiName) {
+    $existingModels = @((Invoke-Az @("cognitiveservices", "account", "deployment", "list", "-g", $ResourceGroupName, "-n", $aiName, "-o", "json")).Out | ConvertFrom-Json | ForEach-Object { $_ })
+    foreach ($candidate in $modelCandidates) {
+        $found = @($existingModels | Where-Object { $_.name -eq $candidate.Name -and $_.sku.name -eq "DataZoneStandard" }) | Select-Object -First 1
+        if ($found) {
+            $chat = @{ Name = $found.name; Version = $found.properties.model.version; Capacity = [int]$found.sku.capacity }
+            Write-Host "  = Keeping this environment's model $($chat.Name)" -ForegroundColor Gray
+            break
+        }
+    }
+}
+if (-not $chat) {
+    $usage = @((Invoke-Az @("cognitiveservices", "usage", "list", "-l", $Location, "-o", "json")).Out | ConvertFrom-Json | ForEach-Object { $_ })
+    $offered = @((Invoke-Az @("cognitiveservices", "model", "list", "-l", $Location, "-o", "json")).Out | ConvertFrom-Json | ForEach-Object { $_ })
+    foreach ($candidate in $modelCandidates) {
+        $isOffered = @($offered | Where-Object { (Get-Prop $_.model "name") -eq $candidate.Name -and (Get-Prop $_.model "version") -eq $candidate.Version -and
+            @(Get-Prop $_.model "skus" | ForEach-Object { Get-Prop $_ "name" }) -contains "DataZoneStandard" }).Count -gt 0
+        $quota = @($usage | Where-Object { $_.name.value -eq "OpenAI.DataZoneStandard.$($candidate.Name)" }) | Select-Object -First 1
+        if (-not $isOffered -or -not $quota) { Write-Host "  = $($candidate.Name) DataZoneStandard is not offered in $Location" -ForegroundColor Gray; continue }
+        $free = [int][Math]::Floor([double]$quota.limit - [double]$quota.currentValue)
+        if ([Math]::Min($wantedCapacity, $free) -ge $minimumCapacity) {
+            $chat = @{ Name = $candidate.Name; Version = $candidate.Version; Capacity = [Math]::Min($wantedCapacity, $free) }
+            break
+        }
+        Write-Host "  = $($candidate.Name): only $free of its US data-zone quota is free" -ForegroundColor Gray
+    }
+    if (-not $chat) { throw "No chat model fits the free US data-zone quota (need $minimumCapacity); free capacity or request more quota." }
+}
+Write-Host "  ✓ Model $($chat.Name) $($chat.Version), DataZoneStandard capacity $($chat.Capacity)" -ForegroundColor Green
+if ($hasRegistryImage) {
+    Write-Host "  = $appName already runs a registry image; building the new revision directly" -ForegroundColor Gray
+} else {
+    Write-Host "  Deploying infrastructure (placeholder image)..." -ForegroundColor Gray
+    Deploy-Template -Image "mcr.microsoft.com/k8se/quickstart:latest" -UseRegistry $false -Revision "placeholder" -PrincipalId $deployerId | Out-Null
+}
+$acrName = (Invoke-Az @("acr", "list", "-g", $ResourceGroupName, "--query", $acrQuery, "-o", "tsv")).Out.Trim()
+if (-not $acrName) { throw "The cardiology app registry was not found in $ResourceGroupName." }
+Write-Host "  ✓ Infrastructure ready (registry $acrName)" -ForegroundColor Green
+
+
+# For a fresh app the environment exists only now; for an existing one this
+# re-raises any lookup failure the quarantine above already acted on.
+Resolve-IdentityFacts
+
 # Offline = no active revision (quarantined now, or left offline by an earlier
 # failed run). Nothing answers at the edge, so sign-in is verified on the control
 # plane only, and the latest revision is reactivated after publishing.
