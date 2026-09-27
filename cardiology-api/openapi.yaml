@@ -31,7 +31,7 @@ info:
 servers:
   - url: /
 security:
-  - entra: [Cardiology.Read]
+  - entra: []
 paths:
   /v1/health:
     get:
@@ -117,7 +117,10 @@ paths:
           schema: { type: integer, minimum: 1, maximum: 5000, default: 500 }
       responses:
         "200":
-          description: Observations, oldest first.
+          description: |
+            Observations, oldest first. Every item's `measure` equals the
+            top-level `measure` (the requested key); each item is bound to that
+            measure's catalog code and unit by its schema.
           content:
             application/json:
               schema:
@@ -128,7 +131,7 @@ paths:
                   measure: { $ref: "#/components/schemas/MeasureKey" }
                   observations:
                     type: array
-                    items: { $ref: "#/components/schemas/Observation" }
+                    items: { $ref: "#/components/schemas/AnyObservation" }
                   truncated:
                     type: boolean
                     description: True when more rows matched than limit.
@@ -167,12 +170,20 @@ components:
   securitySchemes:
     entra:
       type: oauth2
-      description: Microsoft Entra ID (brakekat tenant). App role Cardiology.Read is required.
+      description: |
+        Microsoft Entra ID, brakekat tenant. Callers are services (the app
+        platform's managed identity) using the client-credentials grant, which
+        requests the resource's `/.default` scope. Authorization is by app
+        role: the access token's `roles` claim must contain `Cardiology.Read`;
+        a valid token without it receives 403. `Cardiology.Read` is an app
+        role, not an OAuth scope, so it does not appear in security requirements.
+        Application ID URI: api://hls-cardiology-read (registered with the API
+        implementation).
       flows:
         clientCredentials:
           tokenUrl: https://login.microsoftonline.com/8d038e6a-9b7d-4cb8-bbcf-e84dff156478/oauth2/v2.0/token
           scopes:
-            Cardiology.Read: Read synthetic cardiology subjects, observations, and metrics.
+            api://hls-cardiology-read/.default: All app roles assigned to the calling service principal.
   parameters:
     SubjectId:
       name: subjectId
@@ -192,7 +203,7 @@ components:
         application/problem+json:
           schema: { $ref: "#/components/schemas/Problem" }
     Forbidden:
-      description: Token lacks Cardiology.Read.
+      description: Token is valid but its roles claim lacks Cardiology.Read.
       content:
         application/problem+json:
           schema: { $ref: "#/components/schemas/Problem" }
@@ -234,33 +245,107 @@ components:
           type: array
           items: { $ref: "#/components/schemas/Coding" }
           description: Carries FHIR meta.tag, including the synthetic-demo provenance tag.
-    Observation:
+    ObservationBase:
       type: object
-      required: [measure, code, value, unit, effectiveAt, provenance]
+      required: [value, effectiveAt, provenance]
       properties:
-        measure: { $ref: "#/components/schemas/MeasureKey" }
-        code: { $ref: "#/components/schemas/Coding" }
         value: { type: number }
-        unit: { type: string, description: UCUM unit from the catalog. }
         effectiveAt: { type: string, format: date-time }
         provenance: { $ref: "#/components/schemas/Provenance" }
-    LatestMeasure:
+    LactateObservation:
+      allOf: [{ $ref: "#/components/schemas/ObservationBase" }]
+      type: object
+      required: [measure, code, unit]
+      properties:
+        measure: { const: lactate }
+        code:
+          type: object
+          required: [system, code]
+          properties: { system: { const: "http://loinc.org" }, code: { const: "2524-7" }, display: { type: string } }
+        unit: { const: mmol/L }
+    MapObservation:
+      allOf: [{ $ref: "#/components/schemas/ObservationBase" }]
+      type: object
+      required: [measure, code, unit]
+      properties:
+        measure: { const: map }
+        code:
+          type: object
+          required: [system, code]
+          properties: { system: { const: "http://loinc.org" }, code: { const: "8478-0" }, display: { type: string } }
+        unit: { const: "mm[Hg]" }
+    HeartRateObservation:
+      allOf: [{ $ref: "#/components/schemas/ObservationBase" }]
+      type: object
+      required: [measure, code, unit]
+      properties:
+        measure: { const: heartRate }
+        code:
+          type: object
+          required: [system, code]
+          properties: { system: { const: "http://loinc.org" }, code: { const: "8867-4" }, display: { type: string } }
+        unit: { const: /min }
+    Spo2Observation:
+      allOf: [{ $ref: "#/components/schemas/ObservationBase" }]
+      type: object
+      required: [measure, code, unit]
+      properties:
+        measure: { const: spo2 }
+        code:
+          type: object
+          required: [system, code]
+          properties: { system: { const: "http://loinc.org" }, code: { const: "2708-6" }, display: { type: string } }
+        unit: { const: "%" }
+    DeviceFlowObservation:
+      allOf: [{ $ref: "#/components/schemas/ObservationBase" }]
+      type: object
+      required: [measure, code, unit]
+      properties:
+        measure: { const: deviceFlow }
+        code:
+          type: object
+          required: [system, code]
+          properties: { system: { const: "https://brakekat.com/hls/cardiology/measures" }, code: { const: device-flow-index }, display: { type: string } }
+        unit: { const: "%" }
+    AnyObservation:
       oneOf:
-        - type: object
-          required: [status, observation, stale]
-          properties:
-            status: { const: present }
-            observation: { $ref: "#/components/schemas/Observation" }
-            stale:
-              type: boolean
-              description: effectiveAt older than the catalog maxAgeSeconds for this measure.
-        - type: object
-          required: [status]
-          properties:
-            status: { const: missing }
+        - $ref: "#/components/schemas/LactateObservation"
+        - $ref: "#/components/schemas/MapObservation"
+        - $ref: "#/components/schemas/HeartRateObservation"
+        - $ref: "#/components/schemas/Spo2Observation"
+        - $ref: "#/components/schemas/DeviceFlowObservation"
+    MissingMeasure:
+      type: object
+      required: [status]
+      properties:
+        status: { const: missing }
+      additionalProperties: false
+    Staleness:
+      type: boolean
+      description: effectiveAt is older than the catalog maxAgeSeconds for this measure.
+    LatestLactate:
+      oneOf:
+        - { type: object, required: [status, observation, stale], properties: { status: { const: present }, observation: { $ref: "#/components/schemas/LactateObservation" }, stale: { $ref: "#/components/schemas/Staleness" } } }
+        - $ref: "#/components/schemas/MissingMeasure"
+    LatestMap:
+      oneOf:
+        - { type: object, required: [status, observation, stale], properties: { status: { const: present }, observation: { $ref: "#/components/schemas/MapObservation" }, stale: { $ref: "#/components/schemas/Staleness" } } }
+        - $ref: "#/components/schemas/MissingMeasure"
+    LatestHeartRate:
+      oneOf:
+        - { type: object, required: [status, observation, stale], properties: { status: { const: present }, observation: { $ref: "#/components/schemas/HeartRateObservation" }, stale: { $ref: "#/components/schemas/Staleness" } } }
+        - $ref: "#/components/schemas/MissingMeasure"
+    LatestSpo2:
+      oneOf:
+        - { type: object, required: [status, observation, stale], properties: { status: { const: present }, observation: { $ref: "#/components/schemas/Spo2Observation" }, stale: { $ref: "#/components/schemas/Staleness" } } }
+        - $ref: "#/components/schemas/MissingMeasure"
+    LatestDeviceFlow:
+      oneOf:
+        - { type: object, required: [status, observation, stale], properties: { status: { const: present }, observation: { $ref: "#/components/schemas/DeviceFlowObservation" }, stale: { $ref: "#/components/schemas/Staleness" } } }
+        - $ref: "#/components/schemas/MissingMeasure"
     Device:
       type: object
-      required: [deviceId, kind, serial, associatedSince]
+      required: [deviceId, kind, serial, associatedSince, lastEventAt]
       properties:
         deviceId: { type: string, description: FHIR Device logical id. }
         kind: { type: string }
@@ -273,32 +358,57 @@ components:
     Subject:
       type: object
       description: |
-        Maps to the platform CohortRecord: id=subjectId, observations[key] =
-        latest[key].observation.value when present and not stale, else null,
-        observedAt = max effectiveAt across present measures.
-      required: [subjectId, initials, ageBand, careSetting, primaryCondition, devices, latest]
+        Total mapping to the platform CohortRecord (no value is ever substituted):
+          id               = subjectId
+          initials         = initials
+          ageBand          = ageBand
+          careSetting      = careSetting
+          primaryCondition = primaryCondition.display
+          device           = device ? { kind: device.kind, serial: device.serial } : undefined
+          attendingRole    = attendingRole            (may be null)
+          observations[k]  = latest[k].observation.value when status=present and stale=false, else null
+          observedAt       = observedAt               (may be null)
+        CohortRecord.attendingRole and observedAt are non-null strings today; the
+        platform read adapter must widen both to string | null rather than
+        invent an attending role or a timestamp.
+      required: [subjectId, initials, ageBand, careSetting, primaryCondition, attendingRole, device, latest, observedAt]
       properties:
         subjectId: { type: string }
         initials: { type: string, pattern: "^[A-Z]\\.[A-Z]\\.$" }
         ageBand: { type: string, examples: ["60-69"] }
         careSetting: { $ref: "#/components/schemas/CareSetting" }
-        primaryCondition: { $ref: "#/components/schemas/Coding" }
+        primaryCondition:
+          type: object
+          required: [system, code, display]
+          properties:
+            system: { type: string, format: uri }
+            code: { type: string }
+            display: { type: string, minLength: 1 }
         attendingRole:
           type: [string, "null"]
           description: From CareTeam/PractitionerRole; null when unassigned.
-        devices:
-          type: array
-          items: { $ref: "#/components/schemas/Device" }
+        device:
+          description: |
+            The single active cardiac-device association. Version 1 permits at
+            most one; the projection's row gate rejects a subject with more than
+            one rather than choosing silently. null when no device is associated.
+          oneOf:
+            - $ref: "#/components/schemas/Device"
+            - type: "null"
+        observedAt:
+          type: [string, "null"]
+          format: date-time
+          description: Latest effectiveAt across present measures; null when every measure is missing.
         latest:
           type: object
-          description: One entry per catalog measure key; every key is always present.
+          description: One entry per catalog measure key, each bound to that measure's code and unit.
           required: [lactate, map, heartRate, spo2, deviceFlow]
           properties:
-            lactate: { $ref: "#/components/schemas/LatestMeasure" }
-            map: { $ref: "#/components/schemas/LatestMeasure" }
-            heartRate: { $ref: "#/components/schemas/LatestMeasure" }
-            spo2: { $ref: "#/components/schemas/LatestMeasure" }
-            deviceFlow: { $ref: "#/components/schemas/LatestMeasure" }
+            lactate: { $ref: "#/components/schemas/LatestLactate" }
+            map: { $ref: "#/components/schemas/LatestMap" }
+            heartRate: { $ref: "#/components/schemas/LatestHeartRate" }
+            spo2: { $ref: "#/components/schemas/LatestSpo2" }
+            deviceFlow: { $ref: "#/components/schemas/LatestDeviceFlow" }
           additionalProperties: false
     SourceFreshness:
       type: object
