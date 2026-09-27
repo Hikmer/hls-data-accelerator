@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import http.client
 import json
 import re
 import time
@@ -319,7 +320,11 @@ def _cardiology_app_fqdn(config: dict[str, Any], az_run: Callable[..., Any]) -> 
 
 
 def cardiology_app_check(config: dict[str, Any], az_run: Callable[..., Any]) -> dict[str, str]:
-    """GET https://<fqdn>/api/health on the tagged cardiology Container App."""
+    """The tagged cardiology app serves a built revision on the live profile.
+
+    status alone is not enough: the pre-build placeholder and a local-profile
+    image also answer, and neither is the deployed app.
+    """
     fqdn, error = _cardiology_app_fqdn(config, az_run)
     if not fqdn:
         return _check(CARDIOLOGY_HEALTH_CHECK_NAME, False, error)
@@ -327,13 +332,48 @@ def cardiology_app_check(config: dict[str, Any], az_run: Callable[..., Any]) -> 
     for attempt in range(1, 4):
         try:
             payload = json.loads(_url_bytes(f"https://{fqdn}/api/health", timeout=30))
-            status = payload.get("status")
-            return _check(CARDIOLOGY_HEALTH_CHECK_NAME, status == "ok", f"status={status}, fqdn={fqdn}")
+            status, profile = payload.get("status"), payload.get("profile")
+            model, revision = payload.get("model"), payload.get("revision")
+            ok = status == "ok" and profile == "live" and bool(model) and revision not in (None, "", "placeholder", "local-working-tree")
+            return _check(CARDIOLOGY_HEALTH_CHECK_NAME, ok, f"status={status}, profile={profile}, model={model}, revision={revision}, fqdn={fqdn}")
         except Exception as exc:
             last_error = f"attempt {attempt}/3 {type(exc).__name__}: {exc}"
             if attempt < 3:
                 time.sleep(10)
     return _check(CARDIOLOGY_HEALTH_CHECK_NAME, False, last_error)
+
+
+CARDIOLOGY_SIGN_IN_CHECK_NAME = "Cardiology app sign-in enforced"
+_BROWSER_USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0 Safari/537.36"
+
+
+def _unauthenticated_response(fqdn: str, path: str, browser: bool) -> tuple[int, str]:
+    """(status, Location) for an anonymous request, without following redirects."""
+    connection = http.client.HTTPSConnection(fqdn, timeout=30)
+    headers = {"User-Agent": _BROWSER_USER_AGENT, "Accept": "text/html"} if browser else {}
+    try:
+        connection.request("GET", path, headers=headers)
+        response = connection.getresponse()
+        response.read()
+        return response.status, response.getheader("Location") or ""
+    finally:
+        connection.close()
+
+
+def cardiology_sign_in_check(config: dict[str, Any], az_run: Callable[..., Any]) -> dict[str, str]:
+    """Anonymous browsers are sent to Entra sign-in and anonymous API reads are refused."""
+    fqdn, error = _cardiology_app_fqdn(config, az_run)
+    if not fqdn:
+        return _check(CARDIOLOGY_SIGN_IN_CHECK_NAME, False, error)
+    tenant = str(config.get("expected_tenant_id") or "")
+    try:
+        page_status, location = _unauthenticated_response(fqdn, "/", browser=True)
+        api_status, _ = _unauthenticated_response(fqdn, "/api/activity", browser=False)
+    except Exception as exc:
+        return _check(CARDIOLOGY_SIGN_IN_CHECK_NAME, False, f"{type(exc).__name__}: {exc}")
+    redirected = page_status == 302 and location.startswith(f"https://login.microsoftonline.com/{tenant}/")
+    return _check(CARDIOLOGY_SIGN_IN_CHECK_NAME, redirected and api_status == 401,
+                  f"browser / -> {page_status} {location[:80]}; anonymous /api/activity -> {api_status}")
 
 
 def _eventhub_consumption_check(resources: dict[str, Any], config: dict[str, Any], az_run: Callable[..., Any], entity_name: str) -> dict[str, str]:
@@ -462,4 +502,5 @@ def runtime_feature_checks(
         checks.append(_powerbi_query_check(resources, config, az_run, "Population Health & Quality Semantic Model", "EVALUATE ROW(\"Rows\", COUNTROWS('agg_quality_measures'))"))
     if cardiology_app_expected(config):
         checks.append(cardiology_app_check(config, az_run))
+        checks.append(cardiology_sign_in_check(config, az_run))
     return checks

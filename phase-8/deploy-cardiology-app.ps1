@@ -147,24 +147,16 @@ if ($builtTags.Code -eq 0 -and ($builtTags.Out -split "`n") -contains $tag) {
     Write-Host "  ✓ Built ${ImageRepo}:$tag" -ForegroundColor Green
 }
 
-# ── App revision (role assignments can take a minute to reach the pull) ──────
-$loginServer = (Invoke-Az @("acr", "show", "-n", $acrName, "--query", "loginServer", "-o", "tsv")).Out.Trim()
-$outputs = $null
-for ($attempt = 1; $attempt -le 3; $attempt++) {
-    try {
-        $outputs = Deploy-Template -Image "$loginServer/$ImageRepo`:$tag" -UseRegistry $true -Revision $tag -PrincipalId $deployerId
-        break
-    } catch {
-        if ($attempt -eq 3) { throw }
-        Write-Host "  Revision deploy failed (attempt $attempt/3); waiting 30s for role propagation..." -ForegroundColor Yellow
-        Start-Sleep -Seconds 30
-    }
-}
-$fqdn = Get-Output $outputs "fqdn"
+# ── Entra sign-in, enforced BEFORE the app image is served ───────────────────
+# Until sign-in is verified the app keeps serving what it served before: the
+# public placeholder on a fresh deployment, or the previous signed-in revision on
+# a rerun. The cardiology app itself is never reachable anonymously, including
+# when any step below fails.
+$fqdn = (Invoke-Az @("containerapp", "show", "-g", $ResourceGroupName, "-n", $appName,
+    "--query", "properties.configuration.ingress.fqdn", "-o", "tsv")).Out.Trim()
+if (-not $fqdn) { throw "$appName has no ingress FQDN." }
 $appUrl = "https://$fqdn"
-Write-Host "  ✓ Revision $tag deployed to $appUrl" -ForegroundColor Green
 
-# ── Entra sign-in ────────────────────────────────────────────────────────────
 $displayName = "cardiology-app-$ResourceGroupName"
 $redirect = "$appUrl/.auth/login/aad/callback"
 $appId = (Invoke-Az @("ad", "app", "list", "--display-name", $displayName, "--query", "[0].appId", "-o", "tsv")).Out.Trim()
@@ -181,23 +173,31 @@ if (-not $spId) { $spId = (Invoke-Az @("ad", "sp", "create", "--id", $appId, "--
 # Only assigned users may sign in.
 Invoke-Az @("ad", "sp", "update", "--id", $spId, "--set", "appRoleAssignmentRequired=true") | Out-Null
 
+# Reconcile to exactly the requested accounts: a user dropped from
+# -CardiologyAppUsers loses access on the next deploy.
 $allowed = @($deployerId)
 foreach ($upn in $CardiologyAppUsers | Where-Object { $_ }) {
     $allowed += (Invoke-Az @("ad", "user", "show", "--id", $upn, "--query", "id", "-o", "tsv")).Out.Trim()
 }
-$assignedJson = (Invoke-Az @("rest", "--method", "GET", "--url",
-    "https://graph.microsoft.com/v1.0/servicePrincipals/$spId/appRoleAssignedTo", "-o", "json")).Out | ConvertFrom-Json
-$assigned = @($assignedJson.value | ForEach-Object { $_.principalId })
-foreach ($principal in $allowed | Select-Object -Unique) {
-    if ($assigned -contains $principal) { continue }
+$allowed = @($allowed | Select-Object -Unique)
+$assignmentsUrl = "https://graph.microsoft.com/v1.0/servicePrincipals/$spId/appRoleAssignedTo"
+$existingAssignments = @(((Invoke-Az @("rest", "--method", "GET", "--url", $assignmentsUrl, "-o", "json")).Out | ConvertFrom-Json).value)
+foreach ($assignment in $existingAssignments | Where-Object { $allowed -notcontains $_.principalId }) {
+    Invoke-Az @("rest", "--method", "DELETE", "--url", "$assignmentsUrl/$($assignment.id)", "-o", "none") | Out-Null
+}
+$currentPrincipals = @($existingAssignments | ForEach-Object { $_.principalId })
+foreach ($principal in $allowed | Where-Object { $currentPrincipals -notcontains $_ }) {
     $bodyFile = New-TemporaryFile
     try {
         @{ principalId = $principal; resourceId = $spId; appRoleId = $DefaultAccessRole } | ConvertTo-Json | Set-Content $bodyFile -Encoding utf8
-        Invoke-Az @("rest", "--method", "POST", "--url", "https://graph.microsoft.com/v1.0/servicePrincipals/$spId/appRoleAssignedTo",
+        Invoke-Az @("rest", "--method", "POST", "--url", $assignmentsUrl,
             "--headers", "Content-Type=application/json", "--body", "@$bodyFile", "-o", "none") | Out-Null
     } finally { Remove-Item $bodyFile -ErrorAction SilentlyContinue }
 }
-Write-Host "  ✓ Sign-in limited to $(@($allowed | Select-Object -Unique).Count) assigned account(s)" -ForegroundColor Green
+$verified = @(((Invoke-Az @("rest", "--method", "GET", "--url", $assignmentsUrl, "-o", "json")).Out | ConvertFrom-Json).value |
+    ForEach-Object { $_.principalId } | Sort-Object -Unique)
+if (($verified -join ",") -ne (@($allowed | Sort-Object) -join ",")) { throw "App assignments do not match the requested sign-in accounts." }
+Write-Host "  ✓ Sign-in limited to $($verified.Count) assigned account(s)" -ForegroundColor Green
 
 # A fresh secret each deploy; it is handed straight to Container Apps and never printed.
 $secret = (Invoke-Az @("ad", "app", "credential", "reset", "--id", $appId, "--display-name", "container-apps-auth",
@@ -211,11 +211,7 @@ try {
 Invoke-Az @("containerapp", "auth", "update", "-g", $ResourceGroupName, "-n", $appName, "--enabled", "true",
     "--unauthenticated-client-action", "RedirectToLoginPage", "--redirect-provider", "azureactivedirectory",
     "--excluded-paths", "/api/health", "-o", "none") | Out-Null
-Write-Host "  ✓ Entra sign-in enforced" -ForegroundColor Green
 
-# ── Readiness gate ───────────────────────────────────────────────────────────
-$deadline = (Get-Date).AddMinutes(5)
-$healthOk = $false; $authOk = $false; $lastProblem = ""
 # Easy Auth redirects only browser requests (others get 401), so probe as one,
 # without following the redirect, and require it to land on this tenant's sign-in.
 $handler = [System.Net.Http.HttpClientHandler]::new()
@@ -225,24 +221,51 @@ $browser.Timeout = [TimeSpan]::FromSeconds(15)
 $browser.DefaultRequestHeaders.UserAgent.ParseAdd("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0 Safari/537.36")
 $browser.DefaultRequestHeaders.Accept.ParseAdd("text/html,application/xhtml+xml")
 $signIn = "https://login.microsoftonline.com/$ExpectedTenantId/"
+function Test-SignInEnforced {
+    try {
+        $response = $browser.GetAsync("$appUrl/").GetAwaiter().GetResult()
+        try {
+            $location = if ($response.Headers.Location) { $response.Headers.Location.AbsoluteUri } else { "" }
+            if ([int]$response.StatusCode -eq 302 -and $location.StartsWith($signIn) -and $location.Contains("client_id=$appId")) { return "" }
+            return "unauthenticated browser request to / returned $([int]$response.StatusCode) (Location '$location')"
+        } finally { $response.Dispose() }
+    } catch { return "sign-in probe: $($_.Exception.Message)" }
+}
+
 try {
-    while ((Get-Date) -lt $deadline -and -not ($healthOk -and $authOk)) {
+    $deadline = (Get-Date).AddMinutes(5)
+    $problem = Test-SignInEnforced
+    while ($problem -and (Get-Date) -lt $deadline) { Start-Sleep -Seconds 10; $problem = Test-SignInEnforced }
+    if ($problem) { throw "Sign-in was not enforced within 5 minutes; the app image was not published: $problem" }
+    Write-Host "  ✓ Entra sign-in enforced" -ForegroundColor Green
+
+    # ── App revision (role assignments can take a minute to reach the pull) ──
+    $loginServer = (Invoke-Az @("acr", "show", "-n", $acrName, "--query", "loginServer", "-o", "tsv")).Out.Trim()
+    for ($attempt = 1; $attempt -le 3; $attempt++) {
+        try {
+            Deploy-Template -Image "$loginServer/${ImageRepo}:$tag" -UseRegistry $true -Revision $tag -PrincipalId $deployerId | Out-Null
+            break
+        } catch {
+            if ($attempt -eq 3) { throw }
+            Write-Host "  Revision deploy failed (attempt $attempt/3); waiting 30s for role propagation..." -ForegroundColor Yellow
+            Start-Sleep -Seconds 30
+        }
+    }
+    Write-Host "  ✓ Revision $tag deployed to $appUrl" -ForegroundColor Green
+
+    # ── Readiness gate: the new revision is live AND still behind sign-in ────
+    $deadline = (Get-Date).AddMinutes(5)
+    $healthOk = $false; $problem = "not checked"
+    while ((Get-Date) -lt $deadline -and -not ($healthOk -and -not $problem)) {
         try {
             $health = Invoke-RestMethod -Uri "$appUrl/api/health" -TimeoutSec 15
             $healthOk = $health.status -eq "ok" -and $health.profile -eq "live" -and $health.revision -eq $tag
-            if (-not $healthOk) { $lastProblem = "health reported status=$($health.status) profile=$($health.profile) revision=$($health.revision)" }
-        } catch { $lastProblem = "health: $($_.Exception.Message)" }
-        try {
-            $response = $browser.GetAsync("$appUrl/").GetAwaiter().GetResult()
-            $location = if ($response.Headers.Location) { $response.Headers.Location.AbsoluteUri } else { "" }
-            $authOk = [int]$response.StatusCode -eq 302 -and $location.StartsWith($signIn) -and $location.Contains("client_id=$appId")
-            if (-not $authOk) { $lastProblem = "unauthenticated browser request to / returned $([int]$response.StatusCode) (Location '$location')" }
-            $response.Dispose()
-        } catch { $lastProblem = "sign-in probe: $($_.Exception.Message)" }
-        if (-not ($healthOk -and $authOk)) { Start-Sleep -Seconds 10 }
+            $problem = if ($healthOk) { Test-SignInEnforced } else { "health reported status=$($health.status) profile=$($health.profile) revision=$($health.revision)" }
+        } catch { $healthOk = $false; $problem = "health: $($_.Exception.Message)" }
+        if (-not ($healthOk -and -not $problem)) { Start-Sleep -Seconds 10 }
     }
+    if (-not $healthOk -or $problem) { throw "Cardiology app did not become ready at $appUrl within 5 minutes: $problem" }
 } finally { $browser.Dispose() }
-if (-not ($healthOk -and $authOk)) { throw "Cardiology app did not become ready at $appUrl within 5 minutes: $lastProblem" }
 
 Write-Host "  ✓ $appUrl healthy on revision $tag; unauthenticated visitors are sent to sign-in" -ForegroundColor Green
 Write-Host ""

@@ -246,9 +246,20 @@ def deploy_all_orchestrator(context):
             "status": status,
             "detail": detail,
             "completedPhases": len([p for p in phases if p.get("status") == "succeeded"]),
-            "totalPhases": 13,
+            "totalPhases": 1 if config.get("phase8_only") else 13,
             "resources": resources,
         })
+
+    # ── Phase 8 only: the cardiology app, with no Fabric or earlier phase ─
+    if config.get("phase8_only"):
+        update_status("Phase 8: Cardiology App", "running")
+        result = yield context.call_activity_with_retry(
+            "activity_deploy_cardiology_app", RETRY_POLICY, {"config": config, "resources": resources}
+        )
+        resources.update(result.get("resources", {}))
+        phases.append({"phase": result["phase"], "status": "succeeded", "duration": result["duration_seconds"]})
+        update_status("Deployment Complete", "succeeded")
+        return {"status": "succeeded", "phases": phases, "resources": resources}
 
     # ── Phase 1a: Fabric Workspace ────────────────────────────────
     update_status("Phase 1: Fabric Workspace", "running")

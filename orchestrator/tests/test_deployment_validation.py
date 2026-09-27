@@ -12,6 +12,7 @@ from shared.deployment_validation import (
     _eventhub_consumption_check,
     _quality_report_binding_check,
     cardiology_app_check,
+    cardiology_sign_in_check,
     effective_validation_config,
     fabric_runtime_expected,
     feature_presence_checks,
@@ -314,7 +315,7 @@ class DeploymentValidationTests(unittest.TestCase):
         self.assertEqual([check["name"] for check in presence], ["Cardiology app Container App"])
         self.assertEqual(presence[0]["status"], "pass")
 
-    def test_cardiology_health_passes_on_status_ok(self) -> None:
+    def test_cardiology_health_passes_on_a_built_live_revision(self) -> None:
         captured: list[list[str]] = []
 
         def az_run(args):
@@ -323,7 +324,7 @@ class DeploymentValidationTests(unittest.TestCase):
 
         with patch(
             "shared.deployment_validation._url_bytes",
-            return_value=json.dumps({"status": "ok", "profile": "cardio", "revision": "1"}).encode(),
+            return_value=json.dumps({"status": "ok", "profile": "live", "model": "gpt-5.6-luna", "revision": "9ed0e58ea936"}).encode(),
         ) as url_bytes:
             result = cardiology_app_check(
                 {"resource_group_name": "rg-test", "expected_subscription_id": "sub"},
@@ -335,18 +336,18 @@ class DeploymentValidationTests(unittest.TestCase):
         self.assertIn("rg-test", captured[0])
         self.assertIn("--subscription", captured[0])
 
-    def test_cardiology_health_fails_on_non_ok_status(self) -> None:
-        with patch(
-            "shared.deployment_validation._url_bytes",
-            return_value=json.dumps({"status": "degraded"}).encode(),
+    def test_cardiology_health_rejects_ok_from_anything_but_a_built_live_app(self) -> None:
+        for payload in (
+            {"status": "degraded", "profile": "live", "model": "m", "revision": "abc"},
+            {"status": "ok", "profile": "local", "model": "m", "revision": "abc"},
+            {"status": "ok", "profile": "live", "model": "m", "revision": "placeholder"},
+            {"status": "ok", "profile": "live", "revision": "abc"},
         ):
-            result = cardiology_app_check(
-                {"resource_group_name": "rg-test"},
-                lambda args: _AzResult(_CARDIOLOGY_APP_LIST),
-            )
-
-        self.assertEqual(result["status"], "fail")
-        self.assertIn("status=degraded", result["detail"])
+            with self.subTest(payload=payload), patch(
+                "shared.deployment_validation._url_bytes", return_value=json.dumps(payload).encode(),
+            ):
+                result = cardiology_app_check({"resource_group_name": "rg-test"}, lambda args: _AzResult(_CARDIOLOGY_APP_LIST))
+                self.assertEqual(result["status"], "fail")
 
     def test_cardiology_health_fails_when_unreachable(self) -> None:
         with patch(
@@ -361,6 +362,24 @@ class DeploymentValidationTests(unittest.TestCase):
         self.assertEqual(result["status"], "fail")
         self.assertIn("attempt 3/3", result["detail"])
         self.assertEqual(sleep.call_count, 2)
+
+    def test_cardiology_sign_in_requires_tenant_redirect_and_refused_api(self) -> None:
+        tenant = "8d038e6a-9b7d-4cb8-bbcf-e84dff156478"
+        config = {"resource_group_name": "rg-test", "expected_tenant_id": tenant}
+        sign_in = f"https://login.microsoftonline.com/{tenant}/oauth2/v2.0/authorize?client_id=x"
+        cases = [
+            ({"/": (302, sign_in), "/api/activity": (401, "")}, "pass"),
+            ({"/": (200, ""), "/api/activity": (200, "")}, "fail"),  # auth off
+            ({"/": (302, "https://login.microsoftonline.com/other-tenant/oauth2"), "/api/activity": (401, "")}, "fail"),
+            ({"/": (302, sign_in), "/api/activity": (200, "")}, "fail"),  # API excluded from auth
+        ]
+        for responses, expected in cases:
+            with self.subTest(responses=responses), patch(
+                "shared.deployment_validation._unauthenticated_response",
+                side_effect=lambda fqdn, path, browser, r=responses: r[path],
+            ):
+                result = cardiology_sign_in_check(config, lambda args: _AzResult(_CARDIOLOGY_APP_LIST))
+                self.assertEqual(result["status"], expected, result["detail"])
 
 
 if __name__ == "__main__":

@@ -650,7 +650,8 @@ class Phase7ContinuationRequest(BaseModel):
 
 class Phase8ContinuationRequest(BaseModel):
     cardiology_app_path: str = ""
-    cardiology_app_users: list[str] = []
+    # None keeps the saved list; [] clears every extra sign-in user.
+    cardiology_app_users: list[str] | None = None
 
 
 import re as _re
@@ -1968,7 +1969,7 @@ async def continue_phase8(instance_id: str, req: Phase8ContinuationRequest | Non
     if req:
         if req.cardiology_app_path:
             prior_config["cardiology_app_path"] = req.cardiology_app_path
-        if req.cardiology_app_users:
+        if req.cardiology_app_users is not None:
             prior_config["cardiology_app_users"] = req.cardiology_app_users
     return await start_deploy(DeployRequest(**prior_config))
 
