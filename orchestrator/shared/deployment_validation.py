@@ -417,45 +417,69 @@ def _client_secret_authenticates(tenant: str, client_id: str, secret: str, windo
     return False
 
 
+def _intended_auth_config(client_id: str, tenant: str) -> dict[str, Any]:
+    """The one auth config the deployer writes and accepts (mirrors its
+    Get-IntendedAuthConfig)."""
+    return {
+        "platform": {"enabled": True},
+        "globalValidation": {"unauthenticatedClientAction": "RedirectToLoginPage", "redirectToProvider": "azureactivedirectory",
+                             "excludedPaths": ["/api/health"]},
+        "identityProviders": {"azureActiveDirectory": {
+            "enabled": True,
+            "registration": {"clientId": client_id, "clientSecretSettingName": "microsoft-provider-authentication-secret",
+                             "openIdIssuer": f"https://login.microsoftonline.com/{tenant}/v2.0"},
+            "validation": {"defaultAuthorizationPolicy": {"allowedApplications": []}},
+        }},
+        "login": {"preserveUrlFragmentsForLogins": False, "nonce": {"validateNonce": True}},
+        "httpSettings": {"requireHttps": True},
+    }
+
+
+def _canonical(value: Any) -> Any:
+    """Keys sorted; None, empty objects, and empty lists dropped (the service
+    adds and omits those freely). Booleans are kept."""
+    if isinstance(value, dict):
+        items = {k: c for k, v in sorted(value.items()) if (c := _canonical(v)) is not None}
+        return items or None
+    if isinstance(value, list):
+        items = [c for v in value if (c := _canonical(v)) is not None]
+        return items or None
+    return value
+
+
+def _first_difference(want: Any, got: Any, path: str = "") -> str:
+    if isinstance(want, dict) and isinstance(got, dict):
+        for key in sorted(set(want) | set(got)):
+            if key not in want:
+                return f"{path}{key} (unexpected)"
+            if key not in got:
+                return f"{path}{key} (missing)"
+            if difference := _first_difference(want[key], got[key], f"{path}{key}."):
+                return difference
+        return ""
+    return "" if want == got and type(want) is type(got) else (path.rstrip(".") or "(root)")
+
+
 def _access_policy_problem(auth: dict[str, Any], ingress: dict[str, Any], tenant: str, client_id: str) -> str:
-    """The exact access policy; anything else is weaker (mirrors the deployer's
-    Get-AccessPolicyProblem). Settings that only narrow access are not checked."""
-    validation = auth.get("globalValidation") or {}
-    if (auth.get("platform") or {}).get("enabled") is not True:
-        return "sign-in is disabled"
-    if validation.get("unauthenticatedClientAction") != "RedirectToLoginPage":
-        return "unauthenticated visitors are not redirected to sign-in"
-    if validation.get("redirectToProvider") != "azureactivedirectory":
-        return "sign-in does not redirect to Entra"
-    if list(validation.get("excludedPaths") or []) != ["/api/health"]:
-        return f"unexpected anonymous paths {validation.get('excludedPaths')}"
-    providers = auth.get("identityProviders") or {}
-    for name, value in providers.items():
-        if name == "azureActiveDirectory" or value is None:
-            continue
-        entries = list(value.values()) if name == "customOpenIdConnectProviders" else [value]
-        if any((entry or {}).get("enabled") is not False for entry in entries):
-            return f"identity provider '{name}' is enabled"
-    aad = providers.get("azureActiveDirectory") or {}
-    if not aad or aad.get("enabled") is False:
-        return "Entra sign-in is not configured"
-    registration = aad.get("registration") or {}
-    if registration.get("openIdIssuer") != f"https://login.microsoftonline.com/{tenant}/v2.0":
-        return f"unexpected token issuer {registration.get('openIdIssuer')!r}"
-    if registration.get("clientId") != client_id:
-        return f"sign-in uses client {registration.get('clientId')}, expected {client_id}"
-    if [a for a in (aad.get("validation") or {}).get("allowedAudiences") or [] if a]:
-        return "extra token audiences are accepted"
-    if [u for u in (auth.get("login") or {}).get("allowedExternalRedirectUrls") or [] if u]:
-        return "post-login redirects to external URLs are allowed"
-    if (auth.get("httpSettings") or {}).get("requireHttps") is False:
-        return "sign-in does not require HTTPS"
-    if ingress.get("allowInsecure") is True:
+    """The exact access policy (mirrors the deployer's Get-AccessPolicyProblem).
+
+    The auth config must be exactly _intended_auth_config for this client; only
+    the service-set isAutoProvisioned flag is ignored, so a setting this code
+    never names is still a deviation. Ingress must be HTTPS-only with no CORS
+    policy and no additional ports, on the default HTTP transport.
+    """
+    actual = _canonical(json.loads(json.dumps(auth))) or {}
+    ((actual.get("identityProviders") or {}).get("azureActiveDirectory") or {}).pop("isAutoProvisioned", None)
+    if difference := _first_difference(_canonical(_intended_auth_config(client_id, tenant)), actual):
+        return f"sign-in configuration differs from the intended policy at {difference}"
+    if ingress.get("allowInsecure") is not False:
         return "ingress allows plain HTTP"
     if ingress.get("corsPolicy"):
         return "ingress has a CORS policy"
-    if any((m or {}).get("external") is True for m in ingress.get("additionalPortMappings") or []):
-        return "an additional port is exposed externally"
+    if [m for m in ingress.get("additionalPortMappings") or [] if m]:
+        return "ingress has additional ports"
+    if ingress.get("transport") != "Auto":
+        return f"ingress transport is {ingress.get('transport')}, not Auto"
     return ""
 
 
@@ -504,13 +528,19 @@ def _cardiology_auth_config_problem(config: dict[str, Any], app_name: str, fqdn:
         owner_tag = f"hls-cardiology-app:{subscription}/{resource_group.lower()}/{app_name}"
         if owner_tag not in (application.get("tags") or []):
             return f"registration lacks the owner tag {owner_tag}"
+        if [u for u in ((application.get("spa") or {}).get("redirectUris") or []) + ((application.get("publicClient") or {}).get("redirectUris") or []) if u]:
+            return "registration has SPA or public-client redirect URIs"
+        if application.get("isFallbackPublicClient") is True:
+            return "registration allows public-client flows"
         deployer = _az_json(az_run, ["az", "ad", "signed-in-user", "show", "--query", "id"], str)
-        if others := [o for o in _az_json(az_run, ["az", "ad", "app", "owner", "list", "--id", str(application.get("id")), "--query", "[].id"], list) if o != deployer]:
-            return f"registration has other owners {others}"
+        sp = _az_json(az_run, ["az", "ad", "sp", "show", "--id", client_id], dict)
+        owners = _az_json(az_run, ["az", "ad", "app", "owner", "list", "--id", str(application.get("id")), "--query", "[].id"], list)
+        owners += _az_json(az_run, ["az", "ad", "sp", "owner", "list", "--id", str(sp.get("id")), "--query", "[].id"], list)
+        if others := sorted({o for o in owners if o != deployer}):
+            return f"registration or its service principal has other owners {others}"
         query = urllib.parse.parse_qs(urllib.parse.urlparse(sign_in_location).query)
         if query.get("client_id") != [client_id] or query.get("redirect_uri") != [callback]:
             return "the sign-in redirect does not name this app's registration and callback"
-        sp = _az_json(az_run, ["az", "ad", "sp", "show", "--id", client_id], dict)
         if sp.get("appRoleAssignmentRequired") is not True:
             return "app assignment is not required"
         assigned: set[str] = set()

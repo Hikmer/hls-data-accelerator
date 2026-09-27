@@ -382,21 +382,26 @@ class DeploymentValidationTests(unittest.TestCase):
         sign_in = f"{authorize}?response_type=code+id_token&redirect_uri={callback}&client_id=app&scope=openid"
         protected = {"/": (302, sign_in), "/api/activity": (401, "")}
         good = {
-            "auth": {"platform": {"enabled": True},
+            # The live shape after the deployer's PUT, including the server-set isAutoProvisioned.
+            "auth": {"platform": {"enabled": True}, "encryptionSettings": {},
                      "globalValidation": {"unauthenticatedClientAction": "RedirectToLoginPage", "redirectToProvider": "azureactivedirectory",
                                           "excludedPaths": ["/api/health"]},
                      "identityProviders": {"azureActiveDirectory": {
+                         "enabled": True, "isAutoProvisioned": False,
                          "registration": {"clientId": "app", "clientSecretSettingName": "microsoft-provider-authentication-secret",
                                           "openIdIssuer": f"https://login.microsoftonline.com/{tenant}/v2.0"},
                          "validation": {"defaultAuthorizationPolicy": {"allowedApplications": []}}}},
-                     "login": {"preserveUrlFragmentsForLogins": False}},
-            "ingress": {"external": True, "allowInsecure": False, "corsPolicy": None, "additionalPortMappings": None},
+                     "login": {"preserveUrlFragmentsForLogins": False, "nonce": {"validateNonce": True}},
+                     "httpSettings": {"requireHttps": True}},
+            "ingress": {"external": True, "allowInsecure": False, "corsPolicy": None, "additionalPortMappings": None, "transport": "Auto"},
             "secrets": ["microsoft-provider-authentication-secret"],
             "secret_value": "live",
             "application": {"id": "obj", "signInAudience": "AzureADMyOrg", "tags": ["hls-cardiology-app:sub/rg-test/cardioe2e-app"],
+                            "isFallbackPublicClient": None, "spa": {"redirectUris": []}, "publicClient": {"redirectUris": []},
                             "web": {"redirectUris": ["https://cardio.example.test/.auth/login/aad/callback"],
                                     "implicitGrantSettings": {"enableAccessTokenIssuance": False, "enableIdTokenIssuance": True}}},
             "owners": [],
+            "sp_owners": [],
             "sp": {"id": "sp", "appRoleAssignmentRequired": True},
             "pages": [{"value": [{"principalId": "deployer"}]}],
         }
@@ -425,11 +430,21 @@ class DeploymentValidationTests(unittest.TestCase):
             ("owner tag missing", lambda s: s["application"].update(tags=[])),
             ("owner tag of another group", lambda s: s["application"].update(tags=["hls-cardiology-app:sub/rg-other/cardioe2e-app"])),
             ("another owner", lambda s: s.update(owners=["someone-else"])),
+            ("service principal has another owner", lambda s: s.update(sp_owners=["someone-else"])),
+            ("SPA redirect beside the web callback", lambda s: s["application"]["spa"].update(redirectUris=["https://attacker.example/cb"])),
+            ("public-client redirect", lambda s: s["application"]["publicClient"].update(redirectUris=["http://localhost"])),
+            ("public-client flows allowed", lambda s: s["application"].update(isFallbackPublicClient=True)),
+            ("nonce validation off", lambda s: s["auth"]["login"]["nonce"].update(validateNonce=False)),
+            ("long-lived session cookie", lambda s: s["auth"]["login"].update(cookieExpiration={"convention": "FixedTime", "timeToExpiration": "87600:00:00"})),
+            ("known cookie signing secret", lambda s: s["auth"].update(encryptionSettings={"containerAppAuthSigningSecretName": "known"})),
+            ("disabled GitHub provider (exact policy)", lambda s: s["auth"]["identityProviders"].update(gitHub={"enabled": False})),
+            ("TCP transport", lambda s: s["ingress"].update(transport="Tcp")),
+            ("internal extra port", lambda s: s["ingress"].update(additionalPortMappings=[{"external": False, "targetPort": 9000}])),
         ]
         cases = [
             ("protected with exact policy", protected, good, {}, "pass"),
-            ("disabled GitHub provider is not a weakness", protected, variant(lambda s: s["auth"]["identityProviders"].update(gitHub={"enabled": False})), {}, "pass"),
-            ("deployer as sole owner", protected, variant(lambda s: s.update(owners=["deployer"])), {}, "pass"),
+            ("service omits isAutoProvisioned", protected, variant(lambda s: aad(s).pop("isAutoProvisioned")), {}, "pass"),
+            ("deployer as sole owner of both", protected, variant(lambda s: s.update(owners=["deployer"], sp_owners=["deployer"])), {}, "pass"),
             ("auth off at the edge", {"/": (200, ""), "/api/activity": (200, "")}, good, {}, "fail"),
             ("another tenant's sign-in", {"/": (302, "https://login.microsoftonline.com/other/oauth2"), "/api/activity": (401, "")}, good, {}, "fail"),
             ("API excluded from auth", {"/": (302, sign_in), "/api/activity": (200, "")}, good, {}, "fail"),
@@ -458,6 +473,8 @@ class DeploymentValidationTests(unittest.TestCase):
                     return _AzResult(json.dumps(state["secret_value"]))
                 if args[1:4] == ["ad", "app", "owner"]:
                     return _AzResult(json.dumps(state["owners"]))
+                if args[1:4] == ["ad", "sp", "owner"]:
+                    return _AzResult(json.dumps(state["sp_owners"]))
                 payload = {
                     ("containerapp", "auth"): lambda: state["auth"],
                     ("containerapp", "show"): lambda: state["ingress"],

@@ -58,37 +58,85 @@ function Get-Prop {
     return $null
 }
 
-# The exact access policy, read from the control plane. Anything else is weaker:
-# another identity provider (its users are not subject to app assignment), an
-# extra accepted token audience or another issuer (foreign tokens accepted), an
-# extra anonymous path, an open post-login redirect, plain HTTP, CORS, or an
-# extra externally exposed port (served around the sign-in sidecar). Settings
-# that only narrow access (allowedApplications, jwtClaimChecks) are not checked.
+# The one auth config this deployer writes (PUT whole) and accepts. Nonce
+# validation is explicit because the service allows turning it off.
+function Get-IntendedAuthConfig([string]$ClientId) {
+    return [ordered]@{
+        platform = [ordered]@{ enabled = $true }
+        globalValidation = [ordered]@{ unauthenticatedClientAction = "RedirectToLoginPage"; redirectToProvider = "azureactivedirectory"; excludedPaths = @("/api/health") }
+        identityProviders = [ordered]@{ azureActiveDirectory = [ordered]@{
+            enabled = $true
+            registration = [ordered]@{ clientId = $ClientId; clientSecretSettingName = "microsoft-provider-authentication-secret"; openIdIssuer = "https://login.microsoftonline.com/$ExpectedTenantId/v2.0" }
+            validation = [ordered]@{ defaultAuthorizationPolicy = [ordered]@{ allowedApplications = @() } }
+        } }
+        login = [ordered]@{ preserveUrlFragmentsForLogins = $false; nonce = [ordered]@{ validateNonce = $true } }
+        httpSettings = [ordered]@{ requireHttps = $true }
+    }
+}
+
+# Canonical form for comparison: keys sorted; nulls, empty objects, and empty
+# arrays dropped (the service adds and omits those freely). Booleans are kept.
+function ConvertTo-Canonical($Value) {
+    if ($null -eq $Value) { return $null }
+    if ($Value -is [System.Collections.IDictionary] -or $Value -is [System.Management.Automation.PSCustomObject]) {
+        $names = @(if ($Value -is [System.Collections.IDictionary]) { $Value.Keys } else { $Value.PSObject.Properties | ForEach-Object { $_.Name } })
+        $out = [ordered]@{}
+        foreach ($name in ($names | Sort-Object -CaseSensitive)) {
+            # Read into a variable first: $(...) as an argument would turn a
+            # one-element array into a scalar.
+            $raw = $null
+            if ($Value -is [System.Collections.IDictionary]) { $raw = $Value[$name] } else { $raw = $Value.$name }
+            $item = ConvertTo-Canonical -Value $raw
+            if ($null -ne $item) { $out[$name] = $item }
+        }
+        if ($out.Count) { return $out } else { return $null }
+    }
+    if ($Value -is [string]) { return $Value }
+    if ($Value -is [System.Collections.IEnumerable]) {
+        $items = @(foreach ($entry in $Value) { $c = ConvertTo-Canonical $entry; if ($null -ne $c) { ,$c } })
+        if ($items.Count) { return ,$items } else { return $null }
+    }
+    return $Value
+}
+
+# First path at which two canonical documents differ, or "".
+function Get-FirstDifference($Want, $Got, [string]$Path = "") {
+    if ($Want -is [System.Collections.IDictionary] -and $Got -is [System.Collections.IDictionary]) {
+        foreach ($key in (@($Want.Keys) + @($Got.Keys) | Sort-Object -Unique -CaseSensitive)) {
+            if (-not $Want.Contains($key)) { return "$Path$key (unexpected)" }
+            if (-not $Got.Contains($key)) { return "$Path$key (missing)" }
+            $difference = Get-FirstDifference $Want[$key] $Got[$key] "$Path$key."
+            if ($difference) { return $difference }
+        }
+        return ""
+    }
+    if ((ConvertTo-Json -InputObject $Want -Compress -Depth 20) -ceq (ConvertTo-Json -InputObject $Got -Compress -Depth 20)) { return "" }
+    return $(if ($Path) { $Path.TrimEnd(".") } else { "(root)" })
+}
+
+# The exact access policy, read from the control plane. The auth config must be
+# exactly Get-IntendedAuthConfig for this client (only the service-set
+# isAutoProvisioned flag is ignored): anything else, including a setting this
+# script never names, is a deviation. Ingress must be HTTPS-only with no CORS
+# policy and no additional ports (an extra port is served around the sign-in
+# sidecar), on the default HTTP transport.
 function Get-AccessPolicyProblem {
     param ($Auth, $Ingress, [string]$ClientId = "")
     if (-not $Auth) { return "no sign-in configuration" }
-    $validation = Get-Prop $Auth "globalValidation"
-    if ((Get-Prop (Get-Prop $Auth "platform") "enabled") -ne $true) { return "sign-in is disabled" }
-    if ((Get-Prop $validation "unauthenticatedClientAction") -ne "RedirectToLoginPage") { return "unauthenticated visitors are not redirected to sign-in" }
-    if ((Get-Prop $validation "redirectToProvider") -ne "azureactivedirectory") { return "sign-in does not redirect to Entra" }
-    if ((@(Get-Prop $validation "excludedPaths") -join ",") -cne "/api/health") { return "unexpected anonymous paths '$(@(Get-Prop $validation 'excludedPaths') -join ',')'" }
-    $providers = Get-Prop $Auth "identityProviders"
-    foreach ($provider in @(if ($providers) { $providers.PSObject.Properties } else { @() })) {
-        if ($provider.Name -eq "azureActiveDirectory" -or $null -eq $provider.Value) { continue }
-        $entries = if ($provider.Name -eq "customOpenIdConnectProviders") { @($provider.Value.PSObject.Properties | ForEach-Object { $_.Value }) } else { @($provider.Value) }
-        foreach ($entry in $entries) { if ((Get-Prop $entry "enabled") -ne $false) { return "identity provider '$($provider.Name)' is enabled" } }
+    $actual = ConvertTo-Canonical $Auth
+    $aad = $null  # assigned directly: an if-expression would enumerate the dictionary
+    if ($actual -and $actual.Contains("identityProviders") -and $actual["identityProviders"].Contains("azureActiveDirectory")) { $aad = $actual["identityProviders"]["azureActiveDirectory"] }
+    if ($aad) { $aad.Remove("isAutoProvisioned") }
+    if (-not $ClientId -and $aad -and $aad.Contains("registration") -and $aad["registration"].Contains("clientId")) { $ClientId = $aad["registration"]["clientId"] }
+    if (-not $ClientId) { return "sign-in names no client" }
+    $difference = Get-FirstDifference (ConvertTo-Canonical (Get-IntendedAuthConfig $ClientId)) $actual
+    if ($difference) { return "sign-in configuration differs from the intended policy at $difference" }
+    if ($Ingress) {
+        if ((Get-Prop $Ingress "allowInsecure") -ne $false) { return "ingress allows plain HTTP" }
+        if (Get-Prop $Ingress "corsPolicy") { return "ingress has a CORS policy" }
+        if (@(Get-Prop $Ingress "additionalPortMappings" | Where-Object { $_ }).Count) { return "ingress has additional ports" }
+        if ("$(Get-Prop $Ingress 'transport')" -ne "Auto") { return "ingress transport is $(Get-Prop $Ingress 'transport'), not Auto" }
     }
-    $aad = Get-Prop $providers "azureActiveDirectory"
-    if (-not $aad -or (Get-Prop $aad "enabled") -eq $false) { return "Entra sign-in is not configured" }
-    $registration = Get-Prop $aad "registration"
-    if ((Get-Prop $registration "openIdIssuer") -cne "https://login.microsoftonline.com/$ExpectedTenantId/v2.0") { return "unexpected token issuer '$(Get-Prop $registration 'openIdIssuer')'" }
-    if ($ClientId -and (Get-Prop $registration "clientId") -ne $ClientId) { return "sign-in uses client $(Get-Prop $registration 'clientId'), expected $ClientId" }
-    if (@(Get-Prop (Get-Prop $aad "validation") "allowedAudiences" | Where-Object { $_ }).Count) { return "extra token audiences are accepted" }
-    if (@(Get-Prop (Get-Prop $Auth "login") "allowedExternalRedirectUrls" | Where-Object { $_ }).Count) { return "post-login redirects to external URLs are allowed" }
-    if ((Get-Prop (Get-Prop $Auth "httpSettings") "requireHttps") -eq $false) { return "sign-in does not require HTTPS" }
-    if ((Get-Prop $Ingress "allowInsecure") -eq $true) { return "ingress allows plain HTTP" }
-    if (Get-Prop $Ingress "corsPolicy") { return "ingress has a CORS policy" }
-    if (@(Get-Prop $Ingress "additionalPortMappings" | Where-Object { $_ -and (Get-Prop $_ "external") -eq $true }).Count) { return "an additional port is exposed externally" }
     return ""
 }
 
@@ -273,22 +321,37 @@ $isExternal = (Get-Prop (Get-AppIngress) "external") -eq $true
 # The registration is bound to this app by its sign-in callback (the Container
 # Apps FQDN is unique) and marked with an owner tag naming this subscription,
 # resource group, and app. Lookup is by exact name. It is reused only when its
-# sole redirect URI is this app's exact callback (case-sensitive), or rebound
-# when it carries the owner tag and its sole redirect is an earlier FQDN of the
-# same app (the environment was recreated). It must have no owner other than
-# the deploying user. Anything else is refused, never edited.
+# sole redirect URI is this app's exact web callback (case-sensitive), or
+# rebound when it carries the owner tag and its sole web redirect is an earlier
+# FQDN of the same app (the environment was recreated). Either way it must have
+# no SPA or public-client redirect (those also receive authorization codes), no
+# public-client flows, and no owner other than the deploying user on the
+# application or its service principal (an enterprise-app owner can grant
+# itself access). Anything else is refused before any change, never edited.
 $displayName = "cardiology-app-$ResourceGroupName"
 $redirect = "$appUrl/.auth/login/aad/callback"
 $ownerTag = "hls-cardiology-app:$($account.id)/$($ResourceGroupName.ToLowerInvariant())/$appName"
 $named = @((Invoke-Az @("ad", "app", "list", "--filter", "displayName eq '$displayName'",
-    "--query", "[].{appId:appId,id:id,uris:web.redirectUris,tags:tags}", "-o", "json")).Out | ConvertFrom-Json | ForEach-Object { $_ } | Where-Object { $_ })
+    "--query", "[].{appId:appId,id:id,uris:web.redirectUris,spa:spa.redirectUris,public:publicClient.redirectUris,fallback:isFallbackPublicClient,tags:tags}", "-o", "json")).Out |
+    ConvertFrom-Json | ForEach-Object { $_ } | Where-Object { $_ })
 $bound = @($named | Where-Object { @($_.uris) -ccontains $redirect })
 $earlierCallback = "^https://$([regex]::Escape($appName))\.[a-z0-9-]+\.[a-z0-9-]+\.azurecontainerapps\.io/\.auth/login/aad/callback$"
 $owned = @($named | Where-Object { @($_.tags) -ccontains $ownerTag })
-function Assert-DeployerOnlyOwner([string]$ObjectId) {
-    $owners = @((Invoke-Az @("ad", "app", "owner", "list", "--id", $ObjectId, "--query", "[].id", "-o", "json")).Out | ConvertFrom-Json | ForEach-Object { $_ })
-    $others = @($owners | Where-Object { $_ -ne $deployerId })
-    if ($others.Count) { throw "App registration $displayName has other owners ($($others -join ', ')) who can change it; refusing to use it." }
+function Get-ForeignOwners([string]$AppObjectId, [string]$ClientId) {
+    $owners = @((Invoke-Az @("ad", "app", "owner", "list", "--id", $AppObjectId, "--query", "[].id", "-o", "json")).Out | ConvertFrom-Json | ForEach-Object { $_ })
+    $sp = Invoke-Az @("ad", "sp", "show", "--id", $ClientId, "--query", "id", "-o", "tsv") -AllowFailure
+    if ($sp.Code -eq 0 -and $sp.Out.Trim()) {
+        $owners += @((Invoke-Az @("ad", "sp", "owner", "list", "--id", $sp.Out.Trim(), "--query", "[].id", "-o", "json")).Out | ConvertFrom-Json | ForEach-Object { $_ })
+    }
+    return @($owners | Where-Object { $_ -and $_ -ne $deployerId } | Sort-Object -Unique)
+}
+function Assert-UsableRegistration($Candidate) {
+    if (@($Candidate.spa | Where-Object { $_ }).Count -or @($Candidate.public | Where-Object { $_ }).Count) {
+        throw "App registration $displayName also has SPA or public-client redirect URIs; refusing to use it."
+    }
+    if ($Candidate.fallback -eq $true) { throw "App registration $displayName allows public-client flows; refusing to use it." }
+    $others = @(Get-ForeignOwners $Candidate.id $Candidate.appId)
+    if ($others.Count) { throw "App registration $displayName or its service principal has other owners ($($others -join ', ')) who can change it; refusing to use it." }
 }
 if ($bound.Count -gt 1) { throw "$($bound.Count) app registrations named $displayName are bound to $redirect; remove the extras." }
 if ($bound.Count -eq 1) {
@@ -296,11 +359,11 @@ if ($bound.Count -eq 1) {
     # and its assignments are reconciled below, so it is refused, never edited.
     if (@($bound[0].uris).Count -ne 1) { throw "App registration $displayName also lists other redirect URIs; refusing to reuse a shared registration." }
     $registration = $bound[0]
-    Assert-DeployerOnlyOwner $registration.id
+    Assert-UsableRegistration $registration
     Write-Host "  = Reusing app registration $displayName" -ForegroundColor Gray
 } elseif ($owned.Count -eq 1 -and $named.Count -eq 1 -and @($owned[0].uris).Count -eq 1 -and @($owned[0].uris)[0] -cmatch $earlierCallback) {
     $registration = $owned[0]
-    Assert-DeployerOnlyOwner $registration.id
+    Assert-UsableRegistration $registration
     Invoke-Az @("ad", "app", "update", "--id", $registration.appId, "--web-redirect-uris", $redirect) | Out-Null
     Write-Host "  ✓ Rebound app registration $displayName from $(@($owned[0].uris)[0]) to this app's callback" -ForegroundColor Green
 } elseif ($named.Count -gt 0) {
@@ -429,17 +492,7 @@ try {
     # Then replace the whole auth config with exactly the intended policy, so a
     # loosened setting (another provider, an extra audience, an open redirect,
     # plain HTTP) is removed rather than left beside the fields the CLI updates.
-    $authBody = @{ properties = @{
-        platform = @{ enabled = $true }
-        globalValidation = @{ unauthenticatedClientAction = "RedirectToLoginPage"; redirectToProvider = "azureactivedirectory"; excludedPaths = @("/api/health") }
-        identityProviders = @{ azureActiveDirectory = @{
-            enabled = $true
-            registration = @{ clientId = $appId; clientSecretSettingName = "microsoft-provider-authentication-secret"; openIdIssuer = "https://login.microsoftonline.com/$ExpectedTenantId/v2.0" }
-            validation = @{ defaultAuthorizationPolicy = @{ allowedApplications = @() } }
-        } }
-        login = @{ preserveUrlFragmentsForLogins = $false }
-        httpSettings = @{ requireHttps = $true }
-    } }
+    $authBody = @{ properties = (Get-IntendedAuthConfig $appId) }
     $authFile = New-TemporaryFile
     try {
         $authBody | ConvertTo-Json -Depth 20 | Set-Content $authFile -Encoding utf8
@@ -495,8 +548,10 @@ try {
         if ((Get-Prop $app "signInAudience") -ne "AzureADMyOrg") { return "registration $appId is not single-tenant" }
         if ((Get-Prop (Get-Prop (Get-Prop $app "web") "implicitGrantSettings") "enableAccessTokenIssuance") -eq $true) { return "registration $appId issues implicit access tokens" }
         if (@(Get-Prop $app "tags") -cnotcontains $ownerTag) { return "registration $appId lacks the owner tag $ownerTag" }
-        $others = @((Invoke-Az @("ad", "app", "owner", "list", "--id", $app.id, "--query", "[].id", "-o", "json")).Out | ConvertFrom-Json | ForEach-Object { $_ } | Where-Object { $_ -ne $deployerId })
-        if ($others.Count) { return "registration $appId has other owners ($($others -join ', '))" }
+        if (@(Get-Prop (Get-Prop $app "spa") "redirectUris" | Where-Object { $_ }).Count -or @(Get-Prop (Get-Prop $app "publicClient") "redirectUris" | Where-Object { $_ }).Count) { return "registration $appId has SPA or public-client redirect URIs" }
+        if ((Get-Prop $app "isFallbackPublicClient") -eq $true) { return "registration $appId allows public-client flows" }
+        $others = @(Get-ForeignOwners $app.id $appId)
+        if ($others.Count) { return "registration $appId or its service principal has other owners ($($others -join ', '))" }
         if (-not (Test-ClientSecret (Get-InstalledSecret))) { return "the installed client secret does not authenticate as $appId" }
         return ""
     }
