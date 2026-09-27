@@ -161,7 +161,12 @@ if ($hasRegistryImage) {
         Write-Host "  ! $appName was serving without sign-in; its revisions are offline until sign-in is enforced" -ForegroundColor Yellow
     }
 }
-
+# Offline = no active revision (quarantined now, or left offline by an earlier
+# failed run). Nothing answers at the edge, so sign-in is verified on the control
+# plane only, and the latest revision is reactivated after publishing.
+$activeNow = @((Invoke-Az @("containerapp", "revision", "list", "-g", $ResourceGroupName, "-n", $appName,
+    "--query", "[?properties.active].name", "-o", "tsv")).Out -split "`n" | Where-Object { $_ })
+$offline = $activeNow.Count -eq 0
 
 # ── Entra sign-in, enforced BEFORE the app image is served ───────────────────
 # Until sign-in is verified the app serves only what it served before: the
@@ -274,8 +279,8 @@ function Test-AuthConfig {
 try {
     $problem = Test-AuthConfig
     if ($problem) { throw "Container Apps sign-in is not correctly configured ($problem); the app image was not published." }
-    # Then the live edge, unless quarantined (no active revision answers).
-    if (-not $quarantined) {
+    # Then the live edge, unless offline (no active revision answers).
+    if (-not $offline) {
         $deadline = (Get-Date).AddMinutes(5)
         $problem = Test-SignInEnforced
         while ($problem -and (Get-Date) -lt $deadline) { Start-Sleep -Seconds 10; $problem = Test-SignInEnforced }
@@ -306,6 +311,18 @@ if ($builtTags.Code -eq 0 -and ($builtTags.Out -split "`n") -contains $tag) {
             Write-Host "  Revision deploy failed (attempt $attempt/3); waiting 30s for role propagation..." -ForegroundColor Yellow
             Start-Sleep -Seconds 30
         }
+    }
+    # An unchanged template creates no new revision, so an offline app would
+    # stay offline. Sign-in is verified above; bring the latest revision back.
+    if ($offline) {
+        $latest = (Invoke-Az @("containerapp", "show", "-g", $ResourceGroupName, "-n", $appName,
+            "--query", "properties.latestRevisionName", "-o", "tsv")).Out.Trim()
+        $isActive = (Invoke-Az @("containerapp", "revision", "show", "-g", $ResourceGroupName, "-n", $appName,
+            "--revision", $latest, "--query", "properties.active", "-o", "tsv")).Out.Trim()
+        if ($isActive -ne "true") {
+            Invoke-Az @("containerapp", "revision", "activate", "-g", $ResourceGroupName, "-n", $appName, "--revision", $latest, "-o", "none") | Out-Null
+        }
+        Write-Host "  ✓ Revision $latest back online behind sign-in" -ForegroundColor Green
     }
     Write-Host "  ✓ Revision $tag deployed to $appUrl" -ForegroundColor Green
 
