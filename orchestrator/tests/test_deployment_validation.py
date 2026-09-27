@@ -384,6 +384,7 @@ class DeploymentValidationTests(unittest.TestCase):
                      "globalValidation": {"unauthenticatedClientAction": "RedirectToLoginPage", "excludedPaths": ["/api/health"]},
                      "identityProviders": {"azureActiveDirectory": {"registration": {"clientId": "app", "clientSecretSettingName": "microsoft-provider-authentication-secret"}}}},
             "secrets": ["microsoft-provider-authentication-secret"],
+            "secret_value": "live",
             "sp": {"id": "sp", "appRoleAssignmentRequired": True},
             "pages": [{"value": [{"principalId": "deployer"}]}],
         }
@@ -401,6 +402,8 @@ class DeploymentValidationTests(unittest.TestCase):
             ("another tenant's sign-in", {"/": (302, "https://login.microsoftonline.com/other/oauth2"), "/api/activity": (401, "")}, good, {}, "fail"),
             ("API excluded from auth", {"/": (302, sign_in), "/api/activity": (200, "")}, good, {}, "fail"),
             ("callback secret missing", protected, variant(secrets=[]), {}, "fail"),
+            ("installed secret revoked", protected, variant(secret_value="revoked"), {}, "fail"),
+            ("empty auth output", protected, variant(auth=None), {}, "fail"),
             ("extra anonymous path", protected, extra_path, {}, "fail"),
             ("assignment not required", protected, variant(sp={"id": "sp", "appRoleAssignmentRequired": False}), {}, "fail"),
             ("removed user still assigned", protected, variant(pages=[{"value": [{"principalId": "deployer"}, {"principalId": "old"}]}]), {}, "fail"),
@@ -413,6 +416,8 @@ class DeploymentValidationTests(unittest.TestCase):
             def az_run(args, state=state, pages=pages):
                 if args[:3] == ["az", "containerapp", "list"]:
                     return _AzResult(_CARDIOLOGY_APP_LIST)
+                if args[1:4] == ["containerapp", "secret", "show"]:
+                    return _AzResult(json.dumps(state["secret_value"]))
                 payload = {
                     ("containerapp", "auth"): lambda: state["auth"],
                     ("containerapp", "secret"): lambda: state["secrets"],
@@ -421,12 +426,15 @@ class DeploymentValidationTests(unittest.TestCase):
                     ("ad", "signed-in-user"): lambda: "deployer",
                     ("ad", "user"): lambda: "new-user",
                 }[(args[1], args[2])]()
-                return _AzResult(json.dumps(payload))
+                return _AzResult("" if payload is None else json.dumps(payload))
 
             config = {"resource_group_name": "rg-test", "expected_tenant_id": tenant, **extra_config}
             with self.subTest(label), patch(
                 "shared.deployment_validation._unauthenticated_response",
                 side_effect=lambda fqdn, path, browser, r=responses: r[path],
+            ), patch(
+                "shared.deployment_validation._client_secret_authenticates",
+                side_effect=lambda tenant_id, client_id, secret: (tenant_id, client_id, secret) == (tenant, "app", "live"),
             ):
                 result = cardiology_sign_in_check(config, az_run)
                 self.assertEqual(result["status"], expected, result["detail"])

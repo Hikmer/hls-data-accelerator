@@ -229,12 +229,41 @@ $verified = @(Get-AppAssignments | ForEach-Object { $_ } | ForEach-Object { $_.p
 if (($verified -join ",") -ne (@($allowed | Sort-Object) -join ",")) { throw "App assignments do not match the requested sign-in accounts." }
 Write-Host "  ✓ Sign-in limited to $($verified.Count) assigned account(s)" -ForegroundColor Green
 
-# A new credential per deploy, ADDED beside the working one so a failure before
-# cutover leaves sign-in intact; superseded credentials are removed only after
-# the new one is installed and verified. Never printed; cleared at script end.
-$credentialName = "container-apps-auth-$(Get-Date -Format 'yyyyMMddHHmmss')"
-$secret = (Invoke-Az @("ad", "app", "credential", "reset", "--id", $appId, "--append", "--display-name", $credentialName,
-    "--years", "1", "--query", "password", "-o", "tsv")).Out.Trim()
+# The client secret Container Apps uses to redeem sign-in codes. A secret is
+# proven live by a client-credentials token request as this app. The installed
+# secret is reused while it authenticates; otherwise a credential is ADDED.
+# Credentials are never deleted here, so a failed or overlapping run cannot
+# revoke the secret the app is using. Never printed; cleared at script end.
+function Test-ClientSecret([string]$Value) {
+    if (-not $Value) { return $false }
+    try {
+        $token = Invoke-RestMethod -Method Post -Uri "https://login.microsoftonline.com/$ExpectedTenantId/oauth2/v2.0/token" -TimeoutSec 20 -Body @{
+            client_id = $appId; client_secret = $Value; scope = "https://graph.microsoft.com/.default"; grant_type = "client_credentials" }
+        return [bool]$token.access_token
+    } catch { return $false }
+}
+function Get-InstalledSecret {
+    $auth = Invoke-Az @("containerapp", "auth", "show", "-g", $ResourceGroupName, "-n", $appName, "-o", "json") -AllowFailure
+    try { $settingName = ($auth.Out | ConvertFrom-Json).identityProviders.azureActiveDirectory.registration.clientSecretSettingName } catch { $settingName = "" }
+    if ($auth.Code -ne 0 -or -not $settingName) { return "" }
+    $installed = Invoke-Az @("containerapp", "secret", "show", "-g", $ResourceGroupName, "-n", $appName,
+        "--secret-name", $settingName, "--query", "value", "-o", "tsv") -AllowFailure
+    if ($installed.Code -eq 0) { return $installed.Out.Trim() } else { return "" }
+}
+$secret = Get-InstalledSecret
+if (Test-ClientSecret $secret) {
+    Write-Host "  = Reusing the installed sign-in secret; it authenticates as the app" -ForegroundColor DarkGray
+} else {
+    $credentialName = "container-apps-auth-$(Get-Date -Format 'yyyyMMddHHmmss')"
+    $secret = (Invoke-Az @("ad", "app", "credential", "reset", "--id", $appId, "--append", "--display-name", $credentialName,
+        "--years", "1", "--query", "password", "-o", "tsv")).Out.Trim()
+    $deadline = (Get-Date).AddMinutes(3)
+    while (-not (Test-ClientSecret $secret)) {
+        if ((Get-Date) -gt $deadline) { throw "The new sign-in credential $credentialName was not accepted within 3 minutes." }
+        Start-Sleep -Seconds 10
+    }
+    Write-Host "  ✓ Added sign-in credential $credentialName" -ForegroundColor Green
+}
 Invoke-Az @("containerapp", "auth", "microsoft", "update", "-g", $ResourceGroupName, "-n", $appName,
     "--client-id", $appId, "--client-secret", $secret,
     # The v2 issuer names the tenant; the CLI rejects --tenant-id alongside it.
@@ -264,8 +293,8 @@ function Test-SignInEnforced {
 }
 
 # Control plane: auth is enforcing for this registration, only /api/health is
-# anonymous, and the client secret it references exists (without it the redirect
-# works but every sign-in callback fails).
+# anonymous, and the installed client secret authenticates as the app (without
+# it the redirect works but every sign-in callback fails).
 function Test-AuthConfig {
     $cfg = (Invoke-Az @("containerapp", "auth", "show", "-g", $ResourceGroupName, "-n", $appName, "-o", "json")).Out | ConvertFrom-Json
     $registration = $cfg.identityProviders.azureActiveDirectory.registration
@@ -275,6 +304,7 @@ function Test-AuthConfig {
     if ($registration.clientId -ne $appId) { return "auth uses client $($registration.clientId), expected $appId" }
     if ($excluded -ne "/api/health") { return "unexpected anonymous paths '$excluded'" }
     if ($secretNames -notcontains $registration.clientSecretSettingName) { return "client secret '$($registration.clientSecretSettingName)' is missing from the app" }
+    if (-not (Test-ClientSecret (Get-InstalledSecret))) { return "the installed client secret does not authenticate as $appId" }
     return ""
 }
 
@@ -342,13 +372,6 @@ if ($builtTags.Code -eq 0 -and ($builtTags.Out -split "`n") -contains $tag) {
     if (-not $healthOk -or $problem) { throw "Cardiology app did not become ready at $appUrl within 5 minutes: $problem" }
     $problem = Test-AuthConfig
     if ($problem) { throw "Sign-in configuration broke during the revision deploy: $problem" }
-
-    # Cut over: the new credential is live, so retire the ones it replaced.
-    $superseded = @(((Invoke-Az @("ad", "app", "credential", "list", "--id", $appId, "-o", "json")).Out | ConvertFrom-Json) |
-        Where-Object { "$($_.displayName)".StartsWith("container-apps-auth") -and $_.displayName -ne $credentialName })
-    foreach ($old in $superseded) {
-        Invoke-Az @("ad", "app", "credential", "delete", "--id", $appId, "--key-id", $old.keyId, "-o", "none") | Out-Null
-    }
 } finally { $browser.Dispose(); $secret = $null }
 
 Write-Host "  ✓ $appUrl healthy on revision $tag; unauthenticated visitors are sent to sign-in" -ForegroundColor Green

@@ -8,6 +8,7 @@ import json
 import re
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from collections.abc import Callable
 from typing import Any
@@ -371,50 +372,70 @@ def _unauthenticated_response(fqdn: str, path: str, browser: bool) -> tuple[int,
         connection.close()
 
 
-def _az_json(az_run: Callable[..., Any], args: list[str]) -> Any:
+def _az_json(az_run: Callable[..., Any], args: list[str], expected: type) -> Any:
     proc = az_run([*args, "-o", "json"])
     if proc.returncode != 0:
         raise RuntimeError(f"{' '.join(args[:3])} failed")
-    return json.loads(proc.stdout or "null")
+    value = json.loads(proc.stdout or "null")
+    if not isinstance(value, expected):
+        raise RuntimeError(f"{' '.join(args[:3])} returned no {expected.__name__}")
+    return value
+
+
+def _client_secret_authenticates(tenant: str, client_id: str, secret: str) -> bool:
+    """Only a live secret for this app gets a client-credentials token."""
+    body = urllib.parse.urlencode({"client_id": client_id, "client_secret": secret, "grant_type": "client_credentials",
+                                   "scope": "https://graph.microsoft.com/.default"}).encode()
+    request = urllib.request.Request(f"https://login.microsoftonline.com/{tenant}/oauth2/v2.0/token", data=body)
+    try:
+        with urllib.request.urlopen(request, timeout=20) as response:
+            return response.status == 200 and "access_token" in json.load(response)
+    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError):
+        return False
 
 
 def _cardiology_auth_config_problem(config: dict[str, Any], app_name: str, az_run: Callable[..., Any]) -> str:
     """The control-plane access policy the deployment script establishes.
 
-    Redirect every unauthenticated request except /api/health, keep the client
-    secret the callback redeems codes with, require app assignment, and assign
-    exactly the deploying user plus cardiology_app_users.
+    Redirect every unauthenticated request except /api/health, hold a client
+    secret that authenticates as the app (the callback redeems codes with it),
+    require app assignment, and assign exactly the deploying user plus
+    cardiology_app_users.
     """
     scope = ["-g", str(config.get("resource_group_name") or ""), "-n", app_name]
     if config.get("expected_subscription_id"):
         scope += ["--subscription", str(config["expected_subscription_id"])]
     try:
-        auth = _az_json(az_run, ["az", "containerapp", "auth", "show", *scope])
+        auth = _az_json(az_run, ["az", "containerapp", "auth", "show", *scope], dict)
         validation = auth.get("globalValidation") or {}
         registration = auth["identityProviders"]["azureActiveDirectory"]["registration"]
         if not (auth.get("platform") or {}).get("enabled") or validation.get("unauthenticatedClientAction") != "RedirectToLoginPage":
             return "sign-in does not redirect unauthenticated visitors"
         if list(validation.get("excludedPaths") or []) != ["/api/health"]:
             return f"unexpected anonymous paths {validation.get('excludedPaths')}"
-        secrets = _az_json(az_run, ["az", "containerapp", "secret", "list", *scope, "--query", "[].name"]) or []
-        if registration.get("clientSecretSettingName") not in secrets:
-            return f"client secret '{registration.get('clientSecretSettingName')}' is missing from the app"
+        secrets = _az_json(az_run, ["az", "containerapp", "secret", "list", *scope, "--query", "[].name"], list)
+        setting = registration.get("clientSecretSettingName")
+        if setting not in secrets:
+            return f"client secret '{setting}' is missing from the app"
+        secret = _az_json(az_run, ["az", "containerapp", "secret", "show", *scope, "--secret-name", str(setting), "--query", "value"], str)
+        if not _client_secret_authenticates(str(config.get("expected_tenant_id") or ""), str(registration.get("clientId")), secret):
+            return "the installed client secret does not authenticate as the app"
 
-        sp = _az_json(az_run, ["az", "ad", "sp", "show", "--id", str(registration.get("clientId"))])
+        sp = _az_json(az_run, ["az", "ad", "sp", "show", "--id", str(registration.get("clientId"))], dict)
         if sp.get("appRoleAssignmentRequired") is not True:
             return "app assignment is not required"
         assigned: set[str] = set()
         url = f"https://graph.microsoft.com/v1.0/servicePrincipals/{sp['id']}/appRoleAssignedTo"
         while url:  # Graph pages this collection
-            page = _az_json(az_run, ["az", "rest", "--method", "GET", "--url", url])
+            page = _az_json(az_run, ["az", "rest", "--method", "GET", "--url", url], dict)
             assigned |= {a["principalId"] for a in page.get("value", [])}
             url = page.get("@odata.nextLink")
-        wanted = {str(_az_json(az_run, ["az", "ad", "signed-in-user", "show", "--query", "id"]))}
-        wanted |= {str(_az_json(az_run, ["az", "ad", "user", "show", "--id", upn, "--query", "id"]))
+        wanted = {_az_json(az_run, ["az", "ad", "signed-in-user", "show", "--query", "id"], str)}
+        wanted |= {_az_json(az_run, ["az", "ad", "user", "show", "--id", upn, "--query", "id"], str)
                    for upn in config.get("cardiology_app_users") or [] if upn}
         if assigned != wanted:
             return f"sign-in assignments differ from the requested accounts ({len(assigned)} assigned, {len(wanted)} requested)"
-    except (KeyError, TypeError, RuntimeError, json.JSONDecodeError) as exc:
+    except (KeyError, TypeError, AttributeError, RuntimeError, json.JSONDecodeError) as exc:
         return f"could not verify the sign-in configuration: {exc}"
     return ""
 
