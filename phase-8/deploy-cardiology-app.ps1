@@ -274,10 +274,6 @@ $acrName = (Invoke-Az @("acr", "list", "-g", $ResourceGroupName, "--query", $acr
 if (-not $acrName) { throw "The cardiology app registry was not found in $ResourceGroupName." }
 Write-Host "  ✓ Infrastructure ready (registry $acrName)" -ForegroundColor Green
 
-# An existing cardiology revision must never be served under a weaker policy. If
-# the app runs the real image and its access policy is not exactly the intended
-# one (Get-AccessPolicyProblem), take it offline before any other work: an
-# earlier run may have failed part-way, or someone may have loosened it.
 function Get-AppIngress {
     return (Invoke-Az @("containerapp", "show", "-g", $ResourceGroupName, "-n", $appName, "--query", "properties.configuration.ingress", "-o", "json")).Out | ConvertFrom-Json
 }
@@ -288,10 +284,95 @@ function Stop-AppRevisions {
         Invoke-Az @("containerapp", "revision", "deactivate", "-g", $ResourceGroupName, "-n", $appName, "--revision", $revisionName, "-o", "none") | Out-Null
     }
 }
+
+# ── Identity facts the access checks compare against ────────────────────────
+# The external FQDN is <app>.<environment domain>, known before ingress turns
+# external, so the callback can be registered first. Assignees are exactly the
+# deploying user plus -CardiologyAppUsers.
+$envDomain = (Invoke-Az @("containerapp", "env", "show", "-g", $ResourceGroupName, "-n", "$Prefix-cae",
+    "--query", "properties.defaultDomain", "-o", "tsv")).Out.Trim()
+if (-not $envDomain) { throw "The Container Apps environment $Prefix-cae has no default domain." }
+$fqdn = "$appName.$envDomain"
+$appUrl = "https://$fqdn"
+$redirect = "$appUrl/.auth/login/aad/callback"
+$displayName = "cardiology-app-$ResourceGroupName"
+$ownerTag = "hls-cardiology-app:$($account.id)/$($ResourceGroupName.ToLowerInvariant())/$appName"
+$allowed = @($deployerId)
+foreach ($upn in $CardiologyAppUsers | Where-Object { $_ }) {
+    $allowed += (Invoke-Az @("ad", "user", "show", "--id", $upn, "--query", "id", "-o", "tsv")).Out.Trim()
+}
+$allowed = @($allowed | Select-Object -Unique)
+
+# A list query, so an empty result positively means "no service principal" and
+# a failed lookup throws (fail closed) rather than reading as absent.
+function Get-ServicePrincipalId([string]$ClientId) {
+    $ids = @((Invoke-Az @("ad", "sp", "list", "--filter", "appId eq '$ClientId'", "--query", "[].id", "-o", "json")).Out | ConvertFrom-Json | ForEach-Object { $_ })
+    if ($ids.Count -gt 1) { throw "More than one service principal exists for $ClientId." }
+    if ($ids.Count) { return [string]$ids[0] }
+    return ""
+}
+# Owners of the application and of its service principal (an enterprise-app
+# owner can grant itself access), other than the deploying user.
+function Get-ForeignOwners([string]$AppObjectId, [string]$ServicePrincipalId) {
+    $owners = @((Invoke-Az @("ad", "app", "owner", "list", "--id", $AppObjectId, "--query", "[].id", "-o", "json")).Out | ConvertFrom-Json | ForEach-Object { $_ })
+    if ($ServicePrincipalId) {
+        $owners += @((Invoke-Az @("ad", "sp", "owner", "list", "--id", $ServicePrincipalId, "--query", "[].id", "-o", "json")).Out | ConvertFrom-Json | ForEach-Object { $_ })
+    }
+    return @($owners | Where-Object { $_ -and $_ -ne $deployerId } | Sort-Object -Unique)
+}
+# Graph pages this collection; follow @odata.nextLink so no grant is missed.
+function Get-AppAssignments([string]$ServicePrincipalId) {
+    $all = @(); $url = "https://graph.microsoft.com/v1.0/servicePrincipals/$ServicePrincipalId/appRoleAssignedTo"
+    while ($url) {
+        $page = (Invoke-Az @("rest", "--method", "GET", "--url", $url, "-o", "json")).Out | ConvertFrom-Json
+        $all += @($page.value)
+        $url = if ($page.PSObject.Properties["@odata.nextLink"]) { $page."@odata.nextLink" } else { $null }
+    }
+    return ,$all
+}
+# Registration-level access state for a client: its sole redirect is this app's
+# exact web callback; no SPA or public-client redirects (they also receive
+# codes) or public-client flows; single-tenant; no implicit access tokens; the
+# owner tag; no other owner on the application or its service principal;
+# assignment required; and the assignees. -AssigneesAtMost accepts a missing
+# assignee (quarantine: that is not weaker); otherwise they must match exactly.
+function Get-RegistrationProblem([string]$ClientId, [switch]$AssigneesAtMost) {
+    $app = (Invoke-Az @("ad", "app", "show", "--id", $ClientId, "-o", "json")).Out | ConvertFrom-Json
+    $web = Get-Prop $app "web"
+    $registered = @(Get-Prop $web "redirectUris" | Where-Object { $_ })
+    if ($registered.Count -ne 1 -or $registered -cnotcontains $redirect) { return "registration $ClientId redirect URIs are not exactly the callback $redirect" }
+    if (@(Get-Prop (Get-Prop $app "spa") "redirectUris" | Where-Object { $_ }).Count -or @(Get-Prop (Get-Prop $app "publicClient") "redirectUris" | Where-Object { $_ }).Count) { return "registration $ClientId has SPA or public-client redirect URIs" }
+    if ((Get-Prop $app "isFallbackPublicClient") -eq $true) { return "registration $ClientId allows public-client flows" }
+    if ((Get-Prop $app "signInAudience") -ne "AzureADMyOrg") { return "registration $ClientId is not single-tenant" }
+    if ((Get-Prop (Get-Prop $web "implicitGrantSettings") "enableAccessTokenIssuance") -eq $true) { return "registration $ClientId issues implicit access tokens" }
+    if (@(Get-Prop $app "tags") -cnotcontains $ownerTag) { return "registration $ClientId lacks the owner tag $ownerTag" }
+    $servicePrincipal = Get-ServicePrincipalId $ClientId
+    if (-not $servicePrincipal) { return "registration $ClientId has no service principal" }
+    $others = @(Get-ForeignOwners $app.id $servicePrincipal)
+    if ($others.Count) { return "registration $ClientId or its service principal has other owners ($($others -join ', '))" }
+    $required = (Invoke-Az @("ad", "sp", "show", "--id", $servicePrincipal, "--query", "appRoleAssignmentRequired", "-o", "tsv")).Out.Trim()
+    if ($required -ne "true") { return "app assignment is not required" }
+    $assigned = @(Get-AppAssignments $servicePrincipal | ForEach-Object { $_ } | ForEach-Object { $_.principalId } | Sort-Object -Unique)
+    $extra = @($assigned | Where-Object { $allowed -notcontains $_ })
+    if ($extra.Count) { return "unrequested accounts are assigned ($($extra -join ', '))" }
+    if (-not $AssigneesAtMost -and @($allowed | Where-Object { $assigned -notcontains $_ }).Count) { return "requested accounts are not all assigned" }
+    return ""
+}
+
+# An existing cardiology revision must never be served under a weaker policy. If
+# the app runs the real image and its access state is not the intended one (the
+# auth config and ingress, Get-AccessPolicyProblem; the registration, its service
+# principal, and assignees, Get-RegistrationProblem), or cannot be read, take it
+# offline before any other work: an earlier run may have failed part-way, or
+# someone may have loosened it. The registration itself is not edited here.
 if ($hasRegistryImage) {
-    $authShow = Invoke-Az @("containerapp", "auth", "show", "-g", $ResourceGroupName, "-n", $appName, "-o", "json") -AllowFailure
-    try { $weakness = Get-AccessPolicyProblem ($authShow.Out | ConvertFrom-Json) (Get-AppIngress) } catch { $weakness = "sign-in configuration unreadable: $($_.Exception.Message)" }
-    if ($authShow.Code -ne 0) { $weakness = "sign-in configuration unreadable" }
+    try {
+        $currentAuth = (Invoke-Az @("containerapp", "auth", "show", "-g", $ResourceGroupName, "-n", $appName, "-o", "json")).Out | ConvertFrom-Json
+        $weakness = Get-AccessPolicyProblem $currentAuth (Get-AppIngress)
+        if (-not $weakness) {
+            $weakness = Get-RegistrationProblem ([string]$currentAuth.identityProviders.azureActiveDirectory.registration.clientId) -AssigneesAtMost
+        }
+    } catch { $weakness = "access state unreadable: $($_.Exception.Message)" }
     if ($weakness) {
         Stop-AppRevisions
         Write-Host "  ! $appName was not enforcing the intended sign-in policy ($weakness); its revisions are offline until it is" -ForegroundColor Yellow
@@ -309,48 +390,29 @@ $offline = $activeNow.Count -eq 0
 # public on a fresh deployment (the placeholder has internal ingress), the
 # previous signed-in revision on a rerun, or nothing if it was quarantined above.
 # The cardiology app itself is never reachable anonymously, including when any
-# step below fails. The external FQDN is <app>.<environment domain>, known
-# before ingress turns external, so the callback can be registered first.
-$envDomain = (Invoke-Az @("containerapp", "env", "show", "-g", $ResourceGroupName, "-n", "$Prefix-cae",
-    "--query", "properties.defaultDomain", "-o", "tsv")).Out.Trim()
-if (-not $envDomain) { throw "The Container Apps environment $Prefix-cae has no default domain." }
-$fqdn = "$appName.$envDomain"
-$appUrl = "https://$fqdn"
+# step below fails.
 $isExternal = (Get-Prop (Get-AppIngress) "external") -eq $true
 
 # The registration is bound to this app by its sign-in callback (the Container
-# Apps FQDN is unique) and marked with an owner tag naming this subscription,
-# resource group, and app. Lookup is by exact name. It is reused only when its
-# sole redirect URI is this app's exact web callback (case-sensitive), or
-# rebound when it carries the owner tag and its sole web redirect is an earlier
-# FQDN of the same app (the environment was recreated). Either way it must have
-# no SPA or public-client redirect (those also receive authorization codes), no
-# public-client flows, and no owner other than the deploying user on the
-# application or its service principal (an enterprise-app owner can grant
-# itself access). Anything else is refused before any change, never edited.
-$displayName = "cardiology-app-$ResourceGroupName"
-$redirect = "$appUrl/.auth/login/aad/callback"
-$ownerTag = "hls-cardiology-app:$($account.id)/$($ResourceGroupName.ToLowerInvariant())/$appName"
+# Apps FQDN is unique) and marked with the owner tag. Lookup is by exact name.
+# It is reused only when its sole redirect URI is this app's exact web callback
+# (case-sensitive), or rebound when it carries the owner tag and its sole web
+# redirect is an earlier FQDN of the same app (the environment was recreated).
+# Either way it must have no SPA or public-client redirect, no public-client
+# flows, and no owner other than the deploying user on the application or its
+# service principal. Anything else is refused before any change, never edited.
 $named = @((Invoke-Az @("ad", "app", "list", "--filter", "displayName eq '$displayName'",
     "--query", "[].{appId:appId,id:id,uris:web.redirectUris,spa:spa.redirectUris,public:publicClient.redirectUris,fallback:isFallbackPublicClient,tags:tags}", "-o", "json")).Out |
     ConvertFrom-Json | ForEach-Object { $_ } | Where-Object { $_ })
 $bound = @($named | Where-Object { @($_.uris) -ccontains $redirect })
 $earlierCallback = "^https://$([regex]::Escape($appName))\.[a-z0-9-]+\.[a-z0-9-]+\.azurecontainerapps\.io/\.auth/login/aad/callback$"
 $owned = @($named | Where-Object { @($_.tags) -ccontains $ownerTag })
-function Get-ForeignOwners([string]$AppObjectId, [string]$ClientId) {
-    $owners = @((Invoke-Az @("ad", "app", "owner", "list", "--id", $AppObjectId, "--query", "[].id", "-o", "json")).Out | ConvertFrom-Json | ForEach-Object { $_ })
-    $sp = Invoke-Az @("ad", "sp", "show", "--id", $ClientId, "--query", "id", "-o", "tsv") -AllowFailure
-    if ($sp.Code -eq 0 -and $sp.Out.Trim()) {
-        $owners += @((Invoke-Az @("ad", "sp", "owner", "list", "--id", $sp.Out.Trim(), "--query", "[].id", "-o", "json")).Out | ConvertFrom-Json | ForEach-Object { $_ })
-    }
-    return @($owners | Where-Object { $_ -and $_ -ne $deployerId } | Sort-Object -Unique)
-}
 function Assert-UsableRegistration($Candidate) {
     if (@($Candidate.spa | Where-Object { $_ }).Count -or @($Candidate.public | Where-Object { $_ }).Count) {
         throw "App registration $displayName also has SPA or public-client redirect URIs; refusing to use it."
     }
     if ($Candidate.fallback -eq $true) { throw "App registration $displayName allows public-client flows; refusing to use it." }
-    $others = @(Get-ForeignOwners $Candidate.id $Candidate.appId)
+    $others = @(Get-ForeignOwners $Candidate.id (Get-ServicePrincipalId $Candidate.appId))
     if ($others.Count) { throw "App registration $displayName or its service principal has other owners ($($others -join ', ')) who can change it; refusing to use it." }
 }
 if ($bound.Count -gt 1) { throw "$($bound.Count) app registrations named $displayName are bound to $redirect; remove the extras." }
@@ -385,30 +447,15 @@ if (@($registration.tags) -cnotcontains $ownerTag) {
             "--headers", "Content-Type=application/json", "--body", "@$tagFile", "-o", "none") | Out-Null
     } finally { Remove-Item $tagFile -ErrorAction SilentlyContinue }
 }
-$spId = (Invoke-Az @("ad", "sp", "show", "--id", $appId, "--query", "id", "-o", "tsv") -AllowFailure).Out.Trim()
+$spId = Get-ServicePrincipalId $appId
 if (-not $spId) { $spId = (Invoke-Az @("ad", "sp", "create", "--id", $appId, "--query", "id", "-o", "tsv")).Out.Trim() }
 # Only assigned users may sign in.
 Invoke-Az @("ad", "sp", "update", "--id", $spId, "--set", "appRoleAssignmentRequired=true") | Out-Null
 
 # Reconcile to exactly the requested accounts: a user dropped from
 # -CardiologyAppUsers loses access on the next deploy.
-$allowed = @($deployerId)
-foreach ($upn in $CardiologyAppUsers | Where-Object { $_ }) {
-    $allowed += (Invoke-Az @("ad", "user", "show", "--id", $upn, "--query", "id", "-o", "tsv")).Out.Trim()
-}
-$allowed = @($allowed | Select-Object -Unique)
 $assignmentsUrl = "https://graph.microsoft.com/v1.0/servicePrincipals/$spId/appRoleAssignedTo"
-# Graph pages this collection; follow @odata.nextLink so no grant is missed.
-function Get-AppAssignments {
-    $all = @(); $url = $assignmentsUrl
-    while ($url) {
-        $page = (Invoke-Az @("rest", "--method", "GET", "--url", $url, "-o", "json")).Out | ConvertFrom-Json
-        $all += @($page.value)
-        $url = if ($page.PSObject.Properties["@odata.nextLink"]) { $page."@odata.nextLink" } else { $null }
-    }
-    return ,$all
-}
-$existingAssignments = Get-AppAssignments
+$existingAssignments = Get-AppAssignments $spId
 foreach ($assignment in $existingAssignments | Where-Object { $allowed -notcontains $_.principalId }) {
     Invoke-Az @("rest", "--method", "DELETE", "--url", "$assignmentsUrl/$($assignment.id)", "-o", "none") | Out-Null
 }
@@ -421,7 +468,7 @@ foreach ($principal in $allowed | Where-Object { $currentPrincipals -notcontains
             "--headers", "Content-Type=application/json", "--body", "@$bodyFile", "-o", "none") | Out-Null
     } finally { Remove-Item $bodyFile -ErrorAction SilentlyContinue }
 }
-$verified = @(Get-AppAssignments | ForEach-Object { $_ } | ForEach-Object { $_.principalId } | Sort-Object -Unique)
+$verified = @(Get-AppAssignments $spId | ForEach-Object { $_ } | ForEach-Object { $_.principalId } | Sort-Object -Unique)
 if (($verified -join ",") -ne (@($allowed | Sort-Object) -join ",")) { throw "App assignments do not match the requested sign-in accounts." }
 Write-Host "  ✓ Sign-in limited to $($verified.Count) assigned account(s)" -ForegroundColor Green
 
@@ -526,10 +573,10 @@ try {
     }
 
     # Control plane: the exact access policy for this registration
-    # (Get-AccessPolicyProblem), the registration itself (sole callback,
-    # single-tenant, no implicit access tokens, owner tag, no other owner), and an
-    # installed client secret that authenticates as the app (without it the
-    # redirect works but every sign-in callback fails).
+    # (Get-AccessPolicyProblem), the registration, its service principal, and
+    # exactly the requested assignees (Get-RegistrationProblem), and an installed
+    # client secret that authenticates as the app (without it the redirect works
+    # but every sign-in callback fails).
     # Before publishing, ingress is not yet ours: the publishing template deploy
     # replaces it (a weak ingress already quarantined the app above), so the
     # pre-publish gate checks everything except ingress (-BeforePublish).
@@ -542,16 +589,8 @@ try {
         $settingName = Get-Prop (Get-Prop (Get-Prop (Get-Prop $cfg "identityProviders") "azureActiveDirectory") "registration") "clientSecretSettingName"
         $secretNames = @((Invoke-Az @("containerapp", "secret", "list", "-g", $ResourceGroupName, "-n", $appName, "--query", "[].name", "-o", "tsv")).Out -split "`n")
         if (-not $settingName -or $secretNames -notcontains $settingName) { return "client secret '$settingName' is missing from the app" }
-        $app = (Invoke-Az @("ad", "app", "show", "--id", $appId, "-o", "json")).Out | ConvertFrom-Json
-        $registered = @(Get-Prop (Get-Prop $app "web") "redirectUris" | Where-Object { $_ })
-        if ($registered.Count -ne 1 -or $registered -cnotcontains $redirect) { return "registration $appId redirect URIs are not exactly the callback $redirect" }
-        if ((Get-Prop $app "signInAudience") -ne "AzureADMyOrg") { return "registration $appId is not single-tenant" }
-        if ((Get-Prop (Get-Prop (Get-Prop $app "web") "implicitGrantSettings") "enableAccessTokenIssuance") -eq $true) { return "registration $appId issues implicit access tokens" }
-        if (@(Get-Prop $app "tags") -cnotcontains $ownerTag) { return "registration $appId lacks the owner tag $ownerTag" }
-        if (@(Get-Prop (Get-Prop $app "spa") "redirectUris" | Where-Object { $_ }).Count -or @(Get-Prop (Get-Prop $app "publicClient") "redirectUris" | Where-Object { $_ }).Count) { return "registration $appId has SPA or public-client redirect URIs" }
-        if ((Get-Prop $app "isFallbackPublicClient") -eq $true) { return "registration $appId allows public-client flows" }
-        $others = @(Get-ForeignOwners $app.id $appId)
-        if ($others.Count) { return "registration $appId or its service principal has other owners ($($others -join ', '))" }
+        $registrationProblem = Get-RegistrationProblem $appId
+        if ($registrationProblem) { return $registrationProblem }
         if (-not (Test-ClientSecret (Get-InstalledSecret))) { return "the installed client secret does not authenticate as $appId" }
         return ""
     }
