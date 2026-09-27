@@ -926,11 +926,16 @@ def _validation_from_resources(
             {"name": "Azure resource group empty/deleted", "status": "pass" if azure_count == 0 else "fail", "detail": f"{azure_count} Azure resource(s) found"},
         ]
     else:
+        # A Phase 8-only run deploys only Azure resources; it has no Fabric workspace by design.
+        needs_fabric = not (deploy_config or {}).get("phase8_only")
         checks = [
-            {"name": "Fabric workspace exists", "status": "pass" if workspace_exists else "fail", "detail": "Workspace found" if workspace_exists else "Workspace missing"},
-            {"name": "Fabric items discovered", "status": "pass" if fabric_count > 0 else "warning", "detail": f"{fabric_count} Fabric item(s)"},
             {"name": "Azure resources discovered", "status": "pass" if azure_count > 0 else "warning", "detail": f"{azure_count} Azure resource(s)"},
         ]
+        if needs_fabric:
+            checks[:0] = [
+                {"name": "Fabric workspace exists", "status": "pass" if workspace_exists else "fail", "detail": "Workspace found" if workspace_exists else "Workspace missing"},
+                {"name": "Fabric items discovered", "status": "pass" if fabric_count > 0 else "warning", "detail": f"{fabric_count} Fabric item(s)"},
+            ]
         if deploy_config:
             checks.extend(feature_presence_checks(resources, deploy_config))
         if runtime_checks:
