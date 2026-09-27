@@ -265,7 +265,8 @@ if (Test-ClientSecret $secret) {
     Write-Host "  ✓ Added sign-in credential $credentialName" -ForegroundColor Green
 }
 Invoke-Az @("containerapp", "auth", "microsoft", "update", "-g", $ResourceGroupName, "-n", $appName,
-    "--client-id", $appId, "--client-secret", $secret,
+    # "=" form: generated secrets can start with "-", which argparse reads as a flag.
+    "--client-id", $appId, "--client-secret=$secret",
     # The v2 issuer names the tenant; the CLI rejects --tenant-id alongside it.
     "--issuer", "https://login.microsoftonline.com/$ExpectedTenantId/v2.0", "--yes", "-o", "none") | Out-Null
 Invoke-Az @("containerapp", "auth", "update", "-g", $ResourceGroupName, "-n", $appName, "--enabled", "true",
