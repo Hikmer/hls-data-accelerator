@@ -233,16 +233,19 @@ Write-Host "  ✓ Infrastructure ready (registry $acrName)" -ForegroundColor Gre
 function Get-AppIngress {
     return (Invoke-Az @("containerapp", "show", "-g", $ResourceGroupName, "-n", $appName, "--query", "properties.configuration.ingress", "-o", "json")).Out | ConvertFrom-Json
 }
+function Stop-AppRevisions {
+    $activeRevisions = (Invoke-Az @("containerapp", "revision", "list", "-g", $ResourceGroupName, "-n", $appName,
+        "--query", "[?properties.active].name", "-o", "tsv")).Out -split "`n" | Where-Object { $_ }
+    foreach ($revisionName in $activeRevisions) {
+        Invoke-Az @("containerapp", "revision", "deactivate", "-g", $ResourceGroupName, "-n", $appName, "--revision", $revisionName, "-o", "none") | Out-Null
+    }
+}
 if ($hasRegistryImage) {
     $authShow = Invoke-Az @("containerapp", "auth", "show", "-g", $ResourceGroupName, "-n", $appName, "-o", "json") -AllowFailure
     try { $weakness = Get-AccessPolicyProblem ($authShow.Out | ConvertFrom-Json) (Get-AppIngress) } catch { $weakness = "sign-in configuration unreadable: $($_.Exception.Message)" }
     if ($authShow.Code -ne 0) { $weakness = "sign-in configuration unreadable" }
     if ($weakness) {
-        $activeRevisions = (Invoke-Az @("containerapp", "revision", "list", "-g", $ResourceGroupName, "-n", $appName,
-            "--query", "[?properties.active].name", "-o", "tsv")).Out -split "`n" | Where-Object { $_ }
-        foreach ($revisionName in $activeRevisions) {
-            Invoke-Az @("containerapp", "revision", "deactivate", "-g", $ResourceGroupName, "-n", $appName, "--revision", $revisionName, "-o", "none") | Out-Null
-        }
+        Stop-AppRevisions
         Write-Host "  ! $appName was not enforcing the intended sign-in policy ($weakness); its revisions are offline until it is" -ForegroundColor Yellow
     }
 }
@@ -474,9 +477,14 @@ try {
     # single-tenant, no implicit access tokens, owner tag, no other owner), and an
     # installed client secret that authenticates as the app (without it the
     # redirect works but every sign-in callback fails).
-    function Test-AuthConfig {
+    # Before publishing, ingress is not yet ours: the publishing template deploy
+    # replaces it (a weak ingress already quarantined the app above), so the
+    # pre-publish gate checks everything except ingress (-BeforePublish).
+    function Test-AuthConfig([switch]$BeforePublish) {
         $cfg = (Invoke-Az @("containerapp", "auth", "show", "-g", $ResourceGroupName, "-n", $appName, "-o", "json")).Out | ConvertFrom-Json
-        $weakness = Get-AccessPolicyProblem $cfg (Get-AppIngress) $appId
+        $ingress = $null
+        if (-not $BeforePublish) { $ingress = Get-AppIngress }
+        $weakness = Get-AccessPolicyProblem $cfg $ingress $appId
         if ($weakness) { return $weakness }
         $settingName = Get-Prop (Get-Prop (Get-Prop (Get-Prop $cfg "identityProviders") "azureActiveDirectory") "registration") "clientSecretSettingName"
         $secretNames = @((Invoke-Az @("containerapp", "secret", "list", "-g", $ResourceGroupName, "-n", $appName, "--query", "[].name", "-o", "tsv")).Out -split "`n")
@@ -493,7 +501,7 @@ try {
         return ""
     }
 
-    $problem = Test-AuthConfig
+    $problem = Test-AuthConfig -BeforePublish
     if ($problem) { throw "Container Apps sign-in is not correctly configured ($problem); the app image was not published." }
     # Then the live edge, when something answers there: not offline (no active
     # revision) and not a fresh app still on internal ingress.
@@ -529,8 +537,16 @@ if ($builtTags.Code -eq 0 -and ($builtTags.Out -split "`n") -contains $tag) {
             Start-Sleep -Seconds 30
         }
     }
+    # The template replaced ingress, so the full policy (ingress included) must
+    # hold now, before any quarantined revision is brought back. If it does not,
+    # take the app offline again rather than serve it.
+    $problem = Test-AuthConfig
+    if ($problem) {
+        Stop-AppRevisions
+        throw "The access policy does not hold after publishing ($problem); $appName is offline."
+    }
     # An unchanged template creates no new revision, so an offline app would
-    # stay offline. Sign-in is verified above; bring the latest revision back.
+    # stay offline. The full policy holds; bring the latest revision back.
     if ($offline) {
         $latest = (Invoke-Az @("containerapp", "show", "-g", $ResourceGroupName, "-n", $appName,
             "--query", "properties.latestRevisionName", "-o", "tsv")).Out.Trim()
