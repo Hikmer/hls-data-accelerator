@@ -189,6 +189,9 @@ $named = @((Invoke-Az @("ad", "app", "list", "--filter", "displayName eq '$displ
 $bound = @($named | Where-Object { @($_.uris) -ccontains $redirect })
 if ($bound.Count -gt 1) { throw "$($bound.Count) app registrations named $displayName are bound to $redirect; remove the extras." }
 if ($bound.Count -eq 1) {
+    # Exclusive binding: a registration that also serves other callbacks is shared,
+    # and its assignments are reconciled below, so it is refused, never edited.
+    if (@($bound[0].uris).Count -ne 1) { throw "App registration $displayName also lists other redirect URIs; refusing to reuse a shared registration." }
     $appId = $bound[0].appId
     Invoke-Az @("ad", "app", "update", "--id", $appId, "--enable-id-token-issuance", "true") | Out-Null
     Write-Host "  = Reusing app registration $displayName" -ForegroundColor Gray
@@ -243,22 +246,27 @@ Write-Host "  ✓ Sign-in limited to $($verified.Count) assigned account(s)" -Fo
 # proven live by a client-credentials token request as this app. Entra
 # replicates credential changes gradually and, for minutes after one, refuses a
 # valid secret intermittently (AADSTS7000215), so one token proves a secret and
-# refusal counts only when it persists until -Until (probes 5 s apart, each
-# capped at 10 s and at the time left). The installed secret is reused while it
-# authenticates; otherwise a credential is ADDED. Credentials are never deleted
-# here, so a failed or overlapping run cannot revoke the secret the app is
-# using. Never printed; cleared at script end.
+# refusal counts only when it persists until -Until. Each attempt is one
+# HttpClient POST cancelled at min(10 s, time left); PostAsync buffers the whole
+# body before completing, so the deadline covers connection, headers, and body.
+# The installed secret is reused while it authenticates; otherwise a credential
+# is ADDED. Credentials are never deleted here, so a failed or overlapping run
+# cannot revoke the secret the app is using. Never printed; cleared at script end.
+$tokenClient = [System.Net.Http.HttpClient]::new()
+$tokenClient.Timeout = [System.Threading.Timeout]::InfiniteTimeSpan  # each attempt carries its own deadline
 function Test-ClientSecret([string]$Value, [datetime]$Until = (Get-Date).AddSeconds(30)) {
     if (-not $Value) { return $false }
-    # HttpClient's timeout covers the whole request; budgets never exceed the time left.
-    while (($left = ($Until - (Get-Date)).TotalSeconds) -ge 1) {
+    $form = "client_id=$appId&scope=$([uri]::EscapeDataString('https://graph.microsoft.com/.default'))&grant_type=client_credentials&client_secret=$([uri]::EscapeDataString($Value))"
+    while (($left = ($Until - (Get-Date)).TotalMilliseconds) -gt 0) {
+        $cancel = [System.Threading.CancellationTokenSource]::new([TimeSpan]::FromMilliseconds([Math]::Min(10000, $left)))
+        $response = $null; $content = $null
         try {
-            $token = Invoke-RestMethod -Method Post -Uri "https://login.microsoftonline.com/$ExpectedTenantId/oauth2/v2.0/token" -TimeoutSec ([Math]::Min(10, [Math]::Floor($left))) -Body @{
-                client_id = $appId; client_secret = $Value; scope = "https://graph.microsoft.com/.default"; grant_type = "client_credentials" }
-            if ($token.access_token) { return $true }
-        } catch { }
-        $left = ($Until - (Get-Date)).TotalSeconds
-        if ($left -gt 0) { Start-Sleep -Milliseconds ([int](1000 * [Math]::Min(5, $left))) }
+            $content = [System.Net.Http.StringContent]::new($form, [System.Text.Encoding]::UTF8, "application/x-www-form-urlencoded")
+            $response = $tokenClient.PostAsync("https://login.microsoftonline.com/$ExpectedTenantId/oauth2/v2.0/token", $content, $cancel.Token).GetAwaiter().GetResult()
+            if ($response.IsSuccessStatusCode -and ($response.Content.ReadAsStringAsync().GetAwaiter().GetResult() | ConvertFrom-Json).access_token) { return $true }
+        } catch { } finally { if ($response) { $response.Dispose() }; if ($content) { $content.Dispose() }; $cancel.Dispose() }
+        $left = ($Until - (Get-Date)).TotalMilliseconds
+        if ($left -gt 0) { Start-Sleep -Milliseconds ([int][Math]::Min(5000, $left)) }
     }
     return $false
 }
@@ -324,7 +332,7 @@ function Test-AuthConfig {
     if ($excluded -ne "/api/health") { return "unexpected anonymous paths '$excluded'" }
     if ($secretNames -notcontains $registration.clientSecretSettingName) { return "client secret '$($registration.clientSecretSettingName)' is missing from the app" }
     $registered = @((Invoke-Az @("ad", "app", "show", "--id", $appId, "--query", "web.redirectUris", "-o", "json")).Out | ConvertFrom-Json | ForEach-Object { $_ })
-    if ($registered -cnotcontains $redirect) { return "registration $appId does not list the callback $redirect" }
+    if ($registered.Count -ne 1 -or $registered -cnotcontains $redirect) { return "registration $appId redirect URIs are not exactly the callback $redirect" }
     if (-not (Test-ClientSecret (Get-InstalledSecret))) { return "the installed client secret does not authenticate as $appId" }
     return ""
 }
@@ -393,7 +401,7 @@ if ($builtTags.Code -eq 0 -and ($builtTags.Out -split "`n") -contains $tag) {
     if (-not $healthOk -or $problem) { throw "Cardiology app did not become ready at $appUrl within 5 minutes: $problem" }
     $problem = Test-AuthConfig
     if ($problem) { throw "Sign-in configuration broke during the revision deploy: $problem" }
-} finally { $browser.Dispose(); $secret = $null }
+} finally { $browser.Dispose(); $tokenClient.Dispose(); $secret = $null }
 
 Write-Host "  ✓ $appUrl healthy on revision $tag; unauthenticated visitors are sent to sign-in" -ForegroundColor Green
 Write-Host ""

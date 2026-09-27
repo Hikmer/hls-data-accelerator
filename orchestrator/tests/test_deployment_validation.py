@@ -407,6 +407,7 @@ class DeploymentValidationTests(unittest.TestCase):
             ("empty auth output", protected, variant(auth=None), {}, "fail"),
             ("callback path case differs", protected, variant(redirects=["https://cardio.example.test/.auth/login/aad/CALLBACK"]), {}, "fail"),
             ("callback of another app", protected, variant(redirects=["https://prod.example.test/.auth/login/aad/callback"]), {}, "fail"),
+            ("callback plus another redirect", protected, variant(redirects=["https://cardio.example.test/.auth/login/aad/callback", "https://other.example.test/cb"]), {}, "fail"),
             ("extra anonymous path", protected, extra_path, {}, "fail"),
             ("assignment not required", protected, variant(sp={"id": "sp", "appRoleAssignmentRequired": False}), {}, "fail"),
             ("removed user still assigned", protected, variant(pages=[{"value": [{"principalId": "deployer"}, {"principalId": "old"}]}]), {}, "fail"),

@@ -826,8 +826,9 @@ def _persisted_workspace_id(ws_name: str) -> str:
         return match.group(0) if match else ""
 
     matching = []
-    # Runs on executor threads while the event loop mutates `deployments`;
-    # list() copies the values atomically, so iteration cannot see a resize.
+    # Runs on executor threads while the event loop mutates `deployments` and
+    # its nested status mappings (log handlers add resource links). list() copies
+    # a dict's values atomically, so no iteration below can see a resize.
     for dep in list(deployments.values()):
         cs = dep.get("customStatus") or {}
         if cs.get("workspaceName") == ws_name:
@@ -839,14 +840,14 @@ def _persisted_workspace_id(ws_name: str) -> str:
         for source in (cs.get("links") or {}, cs.get("resources") or {}):
             if not isinstance(source, dict):
                 continue
-            for value in source.values():
+            for value in list(source.values()):
                 workspace_id = extract_workspace_id(value)
                 if workspace_id:
                     return workspace_id
         output = dep.get("output") or {}
         resources = output.get("resources") if isinstance(output, dict) else None
         if isinstance(resources, dict):
-            for value in resources.values():
+            for value in list(resources.values()):
                 workspace_id = extract_workspace_id(value)
                 if workspace_id:
                     return workspace_id

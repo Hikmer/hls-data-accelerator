@@ -405,12 +405,13 @@ def _client_secret_authenticates(tenant: str, client_id: str, secret: str, windo
                                    "scope": "https://graph.microsoft.com/.default"}).encode()
     deadline = time.monotonic() + window
     while (left := deadline - time.monotonic()) > 0:
-        issued: list[bool] = []
         budget = min(10.0, left)
-        probe = threading.Thread(target=lambda out=issued, t=budget: out.append(_token_issued(tenant, body, t)), daemon=True)
+        attempt_deadline = min(deadline, time.monotonic() + budget)
+        issued: list[tuple[bool, float]] = []  # (token issued, completion time)
+        probe = threading.Thread(target=lambda out=issued, t=budget: out.append((_token_issued(tenant, body, t), time.monotonic())), daemon=True)
         probe.start()
         probe.join(budget)
-        if issued and issued[0]:
+        if issued and issued[0][0] and issued[0][1] <= attempt_deadline:
             return True
         time.sleep(max(0.0, min(5.0, deadline - time.monotonic())))
     return False
@@ -421,8 +422,8 @@ def _cardiology_auth_config_problem(config: dict[str, Any], app_name: str, fqdn:
 
     Redirect every unauthenticated request except /api/health, hold a client
     secret that authenticates as the app (the callback redeems codes with it),
-    register this app's exact (case-sensitive) callback, require app assignment,
-    and assign exactly the deploying user plus cardiology_app_users.
+    register exactly this app's callback (case-sensitive, nothing else), require
+    app assignment, and assign exactly the deploying user plus cardiology_app_users.
     """
     scope = ["-g", str(config.get("resource_group_name") or ""), "-n", app_name]
     if config.get("expected_subscription_id"):
@@ -445,8 +446,8 @@ def _cardiology_auth_config_problem(config: dict[str, Any], app_name: str, fqdn:
 
         client_id = str(registration.get("clientId"))
         callback = f"https://{fqdn}/.auth/login/aad/callback"
-        if callback not in _az_json(az_run, ["az", "ad", "app", "show", "--id", client_id, "--query", "web.redirectUris"], list):
-            return f"registration does not list the callback {callback}"
+        if _az_json(az_run, ["az", "ad", "app", "show", "--id", client_id, "--query", "web.redirectUris"], list) != [callback]:
+            return f"registration redirect URIs are not exactly the callback {callback}"
         sp = _az_json(az_run, ["az", "ad", "sp", "show", "--id", client_id], dict)
         if sp.get("appRoleAssignmentRequired") is not True:
             return "app assignment is not required"
