@@ -195,9 +195,6 @@ if ((Invoke-Az @("group", "exists", "-n", $ResourceGroupName)).Out.Trim() -ne "t
 
 # ── Existing app ─────────────────────────────────────────────────────────────
 $appName = "$Prefix-app"
-$current = Invoke-Az @("containerapp", "show", "-g", $ResourceGroupName, "-n", $appName,
-    "--query", "properties.template.containers[0].image", "-o", "tsv") -AllowFailure
-$hasRegistryImage = $current.Code -eq 0 -and $current.Out -match "\.azurecr\.io/${ImageRepo}:"
 $acrQuery = '[?tags."hls-workload"==''cardiology-app''].name | [0]'
 
 function Get-AppIngress {
@@ -210,6 +207,22 @@ function Stop-AppRevisions {
         Invoke-Az @("containerapp", "revision", "deactivate", "-g", $ResourceGroupName, "-n", $appName, "--revision", $revisionName, "-o", "none") | Out-Null
     }
 }
+
+# Discovery is a list query, so an empty result positively means the app does
+# not exist yet (objects, not bare images, so an app with no image still counts).
+# If discovery itself fails, the app may exist in any state: take its revisions
+# offline (best effort) and stop, rather than continue as if it were fresh.
+try {
+    $existing = @((Invoke-Az @("containerapp", "list", "-g", $ResourceGroupName,
+        "--query", "[?name=='$appName'].{image: properties.template.containers[0].image}", "-o", "json")).Out | ConvertFrom-Json | ForEach-Object { $_ })
+} catch {
+    Write-Host "  ! Could not determine whether $appName exists; taking any of its revisions offline before stopping" -ForegroundColor Yellow
+    try { Stop-AppRevisions } catch { Write-Host "    (no revisions could be deactivated: $($_.Exception.Message))" -ForegroundColor Yellow }
+    throw
+}
+$appExists = $existing.Count -gt 0
+# The image only decides the build path; quarantine below covers any existing app.
+$hasRegistryImage = $appExists -and "$(Get-Prop $existing[0] 'image')" -match "\.azurecr\.io/${ImageRepo}:"
 
 # ── Identity facts the access checks compare against ────────────────────────
 # The external FQDN is <app>.<environment domain>, known before ingress turns
@@ -291,15 +304,15 @@ function Get-RegistrationProblem([string]$ClientId, [switch]$AssigneesAtMost) {
     return ""
 }
 
-# An existing cardiology revision must never be served under a weaker policy.
-# This runs before any other work (source, model, infrastructure), so nothing
-# that fails earlier can leave a weakened app online. If
-# the app runs the real image and its access state is not the intended one (the
-# auth config and ingress, Get-AccessPolicyProblem; the registration, its service
-# principal, and assignees, Get-RegistrationProblem), or cannot be read, take it
-# offline before any other work: an earlier run may have failed part-way, or
-# someone may have loosened it. The registration itself is not edited here.
-if ($hasRegistryImage) {
+# An existing cardiology app must never be served under a weaker policy. This
+# runs before any other work (source, model, infrastructure), so nothing that
+# fails earlier can leave a weakened app online. If the app exists (whatever
+# image it runs) and its access state is not the intended one (the auth config
+# and ingress, Get-AccessPolicyProblem; the registration, its service principal,
+# and assignees, Get-RegistrationProblem), or cannot be read, take it offline:
+# an earlier run may have failed part-way, or someone may have loosened it. The
+# registration itself is not edited here.
+if ($appExists) {
     try {
         Resolve-IdentityFacts  # inside the boundary: a failed lookup quarantines too
         $currentAuth = (Invoke-Az @("containerapp", "auth", "show", "-g", $ResourceGroupName, "-n", $appName, "-o", "json")).Out | ConvertFrom-Json
