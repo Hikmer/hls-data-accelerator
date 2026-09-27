@@ -417,39 +417,96 @@ def _client_secret_authenticates(tenant: str, client_id: str, secret: str, windo
     return False
 
 
+def _access_policy_problem(auth: dict[str, Any], ingress: dict[str, Any], tenant: str, client_id: str) -> str:
+    """The exact access policy; anything else is weaker (mirrors the deployer's
+    Get-AccessPolicyProblem). Settings that only narrow access are not checked."""
+    validation = auth.get("globalValidation") or {}
+    if (auth.get("platform") or {}).get("enabled") is not True:
+        return "sign-in is disabled"
+    if validation.get("unauthenticatedClientAction") != "RedirectToLoginPage":
+        return "unauthenticated visitors are not redirected to sign-in"
+    if validation.get("redirectToProvider") != "azureactivedirectory":
+        return "sign-in does not redirect to Entra"
+    if list(validation.get("excludedPaths") or []) != ["/api/health"]:
+        return f"unexpected anonymous paths {validation.get('excludedPaths')}"
+    providers = auth.get("identityProviders") or {}
+    for name, value in providers.items():
+        if name == "azureActiveDirectory" or value is None:
+            continue
+        entries = list(value.values()) if name == "customOpenIdConnectProviders" else [value]
+        if any((entry or {}).get("enabled") is not False for entry in entries):
+            return f"identity provider '{name}' is enabled"
+    aad = providers.get("azureActiveDirectory") or {}
+    if not aad or aad.get("enabled") is False:
+        return "Entra sign-in is not configured"
+    registration = aad.get("registration") or {}
+    if registration.get("openIdIssuer") != f"https://login.microsoftonline.com/{tenant}/v2.0":
+        return f"unexpected token issuer {registration.get('openIdIssuer')!r}"
+    if registration.get("clientId") != client_id:
+        return f"sign-in uses client {registration.get('clientId')}, expected {client_id}"
+    if [a for a in (aad.get("validation") or {}).get("allowedAudiences") or [] if a]:
+        return "extra token audiences are accepted"
+    if [u for u in (auth.get("login") or {}).get("allowedExternalRedirectUrls") or [] if u]:
+        return "post-login redirects to external URLs are allowed"
+    if (auth.get("httpSettings") or {}).get("requireHttps") is False:
+        return "sign-in does not require HTTPS"
+    if ingress.get("allowInsecure") is True:
+        return "ingress allows plain HTTP"
+    if ingress.get("corsPolicy"):
+        return "ingress has a CORS policy"
+    if any((m or {}).get("external") is True for m in ingress.get("additionalPortMappings") or []):
+        return "an additional port is exposed externally"
+    return ""
+
+
 def _cardiology_auth_config_problem(config: dict[str, Any], app_name: str, fqdn: str, sign_in_location: str,
                                     az_run: Callable[..., Any]) -> str:
     """The control-plane access policy the deployment script establishes.
 
-    Redirect every unauthenticated request except /api/health, hold a client
-    secret that authenticates as the app (the callback redeems codes with it),
-    register exactly this app's callback (case-sensitive, nothing else), send
-    anonymous browsers to sign-in for that registration and callback, require
-    app assignment, and assign exactly the deploying user plus cardiology_app_users.
+    The exact auth and ingress policy (_access_policy_problem); a client secret
+    that authenticates as the app (the callback redeems codes with it); a
+    registration whose sole redirect URI is this app's callback (case-sensitive),
+    single-tenant, without implicit access tokens, carrying this deployment's
+    owner tag and owned by no one but the deploying user; anonymous browsers sent
+    to sign-in for that registration and callback; app assignment required; and
+    exactly the deploying user plus cardiology_app_users assigned.
     """
-    scope = ["-g", str(config.get("resource_group_name") or ""), "-n", app_name]
+    resource_group = str(config.get("resource_group_name") or "")
+    tenant = str(config.get("expected_tenant_id") or "")
+    scope = ["-g", resource_group, "-n", app_name]
     if config.get("expected_subscription_id"):
         scope += ["--subscription", str(config["expected_subscription_id"])]
     try:
         auth = _az_json(az_run, ["az", "containerapp", "auth", "show", *scope], dict)
-        validation = auth.get("globalValidation") or {}
+        ingress = _az_json(az_run, ["az", "containerapp", "show", *scope, "--query", "properties.configuration.ingress"], dict)
         registration = auth["identityProviders"]["azureActiveDirectory"]["registration"]
-        if not (auth.get("platform") or {}).get("enabled") or validation.get("unauthenticatedClientAction") != "RedirectToLoginPage":
-            return "sign-in does not redirect unauthenticated visitors"
-        if list(validation.get("excludedPaths") or []) != ["/api/health"]:
-            return f"unexpected anonymous paths {validation.get('excludedPaths')}"
+        client_id = str(registration.get("clientId"))
+        if weakness := _access_policy_problem(auth, ingress, tenant, client_id):
+            return weakness
         secrets = _az_json(az_run, ["az", "containerapp", "secret", "list", *scope, "--query", "[].name"], list)
         setting = registration.get("clientSecretSettingName")
         if setting not in secrets:
             return f"client secret '{setting}' is missing from the app"
         secret = _az_json(az_run, ["az", "containerapp", "secret", "show", *scope, "--secret-name", str(setting), "--query", "value"], str)
-        if not _client_secret_authenticates(str(config.get("expected_tenant_id") or ""), str(registration.get("clientId")), secret):
+        if not _client_secret_authenticates(tenant, client_id, secret):
             return "the installed client secret does not authenticate as the app"
 
-        client_id = str(registration.get("clientId"))
         callback = f"https://{fqdn}/.auth/login/aad/callback"
-        if _az_json(az_run, ["az", "ad", "app", "show", "--id", client_id, "--query", "web.redirectUris"], list) != [callback]:
+        application = _az_json(az_run, ["az", "ad", "app", "show", "--id", client_id], dict)
+        web = application.get("web") or {}
+        if web.get("redirectUris") != [callback]:
             return f"registration redirect URIs are not exactly the callback {callback}"
+        if application.get("signInAudience") != "AzureADMyOrg":
+            return "registration is not single-tenant"
+        if (web.get("implicitGrantSettings") or {}).get("enableAccessTokenIssuance") is True:
+            return "registration issues implicit access tokens"
+        subscription = str(config.get("expected_subscription_id") or "") or _az_json(az_run, ["az", "account", "show", "--query", "id"], str)
+        owner_tag = f"hls-cardiology-app:{subscription}/{resource_group.lower()}/{app_name}"
+        if owner_tag not in (application.get("tags") or []):
+            return f"registration lacks the owner tag {owner_tag}"
+        deployer = _az_json(az_run, ["az", "ad", "signed-in-user", "show", "--query", "id"], str)
+        if others := [o for o in _az_json(az_run, ["az", "ad", "app", "owner", "list", "--id", str(application.get("id")), "--query", "[].id"], list) if o != deployer]:
+            return f"registration has other owners {others}"
         query = urllib.parse.parse_qs(urllib.parse.urlparse(sign_in_location).query)
         if query.get("client_id") != [client_id] or query.get("redirect_uri") != [callback]:
             return "the sign-in redirect does not name this app's registration and callback"
@@ -462,7 +519,7 @@ def _cardiology_auth_config_problem(config: dict[str, Any], app_name: str, fqdn:
             page = _az_json(az_run, ["az", "rest", "--method", "GET", "--url", url], dict)
             assigned |= {a["principalId"] for a in page.get("value", [])}
             url = page.get("@odata.nextLink")
-        wanted = {_az_json(az_run, ["az", "ad", "signed-in-user", "show", "--query", "id"], str)}
+        wanted = {deployer}
         wanted |= {_az_json(az_run, ["az", "ad", "user", "show", "--id", upn, "--query", "id"], str)
                    for upn in config.get("cardiology_app_users") or [] if upn}
         if assigned != wanted:

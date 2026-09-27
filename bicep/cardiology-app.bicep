@@ -6,8 +6,10 @@
 // by phase-8/deploy-cardiology-app.ps1 because it needs an app registration and
 // a client secret, neither of which belongs in a template.
 //
-// Deployed twice per fresh environment: first with a public placeholder image
-// (the registry is empty until the image is built), then with the built image.
+// Deployed twice per fresh environment: first with a placeholder image on
+// INTERNAL ingress (the registry is empty and sign-in is not yet configured, so
+// nothing may answer from the internet), then with the built image on external
+// ingress once the deployment script has enforced Entra sign-in.
 
 @description('Short prefix for resource names.')
 @maxLength(12)
@@ -34,6 +36,16 @@ param tags object = {}
 @description('Entra client secret for Container Apps sign-in. A container app deployment replaces the app\'s whole secret set, so every deployment after sign-in is configured must pass it back or sign-in callbacks break.')
 @secure()
 param authClientSecret string = ''
+
+@description('Chat model the loop calls, deployed DataZoneStandard (US data zone). The deployment script keeps an existing environment\'s model and otherwise picks one the data-zone quota can hold.')
+param chatModel string = 'gpt-5.6-luna'
+
+@description('Version of chatModel.')
+param chatModelVersion string = '2026-07-09'
+
+@description('Tokens-per-minute capacity of chatModel, in thousands.')
+@minValue(10)
+param chatCapacity int = 300
 
 var suffix = uniqueString(resourceGroup().id)
 var allTags = union(tags, { 'hls-workload': 'cardiology-app', dataClassification: 'synthetic-only' })
@@ -65,20 +77,20 @@ resource ai 'Microsoft.CognitiveServices/accounts@2024-10-01' = {
   }
 }
 
-// DataZoneStandard keeps inference in the US data zone. Capacity fits the
-// eastus2 DataZoneStandard quota (333).
-resource luna 'Microsoft.CognitiveServices/accounts/deployments@2024-10-01' = {
+// DataZoneStandard keeps inference in the US data zone. Its quota is counted
+// across the whole zone, not per region, so the script sizes chatCapacity to fit.
+resource chat 'Microsoft.CognitiveServices/accounts/deployments@2024-10-01' = {
   parent: ai
-  name: 'gpt-5.6-luna'
+  name: chatModel
   sku: {
     name: 'DataZoneStandard'
-    capacity: 300
+    capacity: chatCapacity
   }
   properties: {
     model: {
       format: 'OpenAI'
-      name: 'gpt-5.6-luna'
-      version: '2026-07-09'
+      name: chatModel
+      version: chatModelVersion
     }
     versionUpgradeOption: 'OnceCurrentVersionExpired'
   }
@@ -162,7 +174,8 @@ resource app 'Microsoft.App/containerApps@2024-03-01' = {
     managedEnvironmentId: env.id
     configuration: {
       ingress: {
-        external: true
+        // Internal until the built image is published behind enforced sign-in.
+        external: useRegistryImage
         // The placeholder image listens on 80; the app on 4317.
         targetPort: useRegistryImage ? 4317 : 80
         transport: 'auto'
@@ -192,7 +205,7 @@ resource app 'Microsoft.App/containerApps@2024-03-01' = {
           env: [
             { name: 'CALDOVA_PROFILE', value: 'live' }
             { name: 'FOUNDRY_ENDPOINT', value: 'https://${aiName}.cognitiveservices.azure.com' }
-            { name: 'FOUNDRY_DEPLOYMENT', value: luna.name }
+            { name: 'FOUNDRY_DEPLOYMENT', value: chat.name }
             { name: 'CALDOVA_TICK_MS', value: '2000' }
             { name: 'CALDOVA_REVISION', value: revision }
             { name: 'AZURE_CLIENT_ID', value: appIdentity.properties.clientId }

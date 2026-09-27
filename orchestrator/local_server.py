@@ -419,6 +419,32 @@ def reconcile_interrupted_teardowns() -> int:
 # Track active subprocess PIDs for cancellation
 active_processes: dict[str, int] = {}  # instance_id → PID
 
+# Resource groups with a live deploy or teardown task in THIS process (persisted
+# "Running" records can be stale after a restart, so they are not consulted).
+# Two runs against one resource group race on its app registration, sign-in
+# secret, assignments, and revisions, so a second start is refused until the
+# first task finishes. Check-and-claim happens with no await in between.
+_active_rg_runs: dict[str, str] = {}  # lowercase resource group -> instance id
+
+
+def _active_run_for(resource_group: str) -> str | None:
+    return _active_rg_runs.get(resource_group.strip().lower()) if resource_group else None
+
+
+def _claim_resource_group(resource_group: str, instance_id: str, task: asyncio.Task) -> None:
+    """Record instance_id as the live run for resource_group until task finishes."""
+    key = resource_group.strip().lower()
+    if not key:
+        return
+    _active_rg_runs[key] = instance_id
+
+    def release(_task: asyncio.Task) -> None:
+        if _active_rg_runs.get(key) == instance_id:
+            del _active_rg_runs[key]
+
+    task.add_done_callback(release)
+
+
 # Track active teardown scans for incremental UI updates
 scan_jobs: dict[str, dict] = {}
 
@@ -1070,6 +1096,9 @@ def _extract_deployment_links(message: str) -> dict[str, str]:
 
 @app.post("/api/teardown/start")
 async def start_teardown(req: TeardownRequest):
+    holder = _active_run_for(req.resource_group_name)
+    if holder:
+        raise HTTPException(409, f"Run {holder} is still active for resource group {req.resource_group_name}")
     now_local = datetime.now()
     timestamp = now_local.strftime("%Y%m%d-%H%M%S")
     import random
@@ -1111,7 +1140,8 @@ async def start_teardown(req: TeardownRequest):
     save_state()
 
     # Run teardown in background
-    _create_logged_task(_run_teardown(instance_id, req), name=f"teardown:{instance_id}")
+    task = _create_logged_task(_run_teardown(instance_id, req), name=f"teardown:{instance_id}")
+    _claim_resource_group(req.resource_group_name, instance_id, task)
 
     logger.info("Teardown started: %s (workspace=%s, rg=%s)",
                 instance_id, req.fabric_workspace_name, req.resource_group_name)
@@ -1122,6 +1152,13 @@ async def start_teardown(req: TeardownRequest):
 async def start_teardown_batch(req: TeardownBatchRequest):
     batch_id = f"teardownBatch-{datetime.now().strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:4]}"
     children = []
+    # Refuse the whole batch up front rather than leave it half-started.
+    batch_groups = [job.resource_group_name.strip().lower() for job in req.jobs if job.resource_group_name]
+    if len(batch_groups) != len(set(batch_groups)):
+        raise HTTPException(409, "The batch names a resource group more than once")
+    busy = [f"{job.resource_group_name} ({_active_run_for(job.resource_group_name)})" for job in req.jobs if _active_run_for(job.resource_group_name)]
+    if busy:
+        raise HTTPException(409, f"Runs are still active for: {', '.join(busy)}")
     for job in req.jobs:
         result = await start_teardown(job)
         children.append(result["instanceId"])
@@ -1821,6 +1858,9 @@ def _apply_resume_skips(req: DeployRequest) -> None:
 
 @app.post("/api/deploy/start")
 async def start_deploy(req: DeployRequest):
+    # Early refusal skips the resume checks; the final check below is the atomic one.
+    if holder := _active_run_for(req.resource_group_name):
+        raise HTTPException(409, f"Run {holder} is still active for resource group {req.resource_group_name}")
     _apply_scaffolding_only(req)
     _apply_reseed_data(req)
     # Continue-from-failure uses the exact failed source run. Default starts keep
@@ -1899,6 +1939,9 @@ async def start_deploy(req: DeployRequest):
 
     phase_label = "P" + "".join(str(m) for m in milestones)
 
+    # No await from here to the claim: check-and-claim is atomic on the event loop.
+    if holder := _active_run_for(req.resource_group_name):
+        raise HTTPException(409, f"Run {holder} is still active for resource group {req.resource_group_name}")
     instance_id = f"{phase_label}-{timestamp}"
     deployment = {
         "instanceId": instance_id,
@@ -1937,7 +1980,8 @@ async def start_deploy(req: DeployRequest):
     save_state()
 
     # Run deployment in background
-    _create_logged_task(_run_deploy(instance_id, req), name=f"deploy:{instance_id}")
+    task = _create_logged_task(_run_deploy(instance_id, req), name=f"deploy:{instance_id}")
+    _claim_resource_group(req.resource_group_name, instance_id, task)
 
     logger.info("Deployment started: %s (workspace=%s, rg=%s)",
                 instance_id, req.fabric_workspace_name, req.resource_group_name)

@@ -383,41 +383,70 @@ class DeploymentValidationTests(unittest.TestCase):
         protected = {"/": (302, sign_in), "/api/activity": (401, "")}
         good = {
             "auth": {"platform": {"enabled": True},
-                     "globalValidation": {"unauthenticatedClientAction": "RedirectToLoginPage", "excludedPaths": ["/api/health"]},
-                     "identityProviders": {"azureActiveDirectory": {"registration": {"clientId": "app", "clientSecretSettingName": "microsoft-provider-authentication-secret"}}}},
+                     "globalValidation": {"unauthenticatedClientAction": "RedirectToLoginPage", "redirectToProvider": "azureactivedirectory",
+                                          "excludedPaths": ["/api/health"]},
+                     "identityProviders": {"azureActiveDirectory": {
+                         "registration": {"clientId": "app", "clientSecretSettingName": "microsoft-provider-authentication-secret",
+                                          "openIdIssuer": f"https://login.microsoftonline.com/{tenant}/v2.0"},
+                         "validation": {"defaultAuthorizationPolicy": {"allowedApplications": []}}}},
+                     "login": {"preserveUrlFragmentsForLogins": False}},
+            "ingress": {"external": True, "allowInsecure": False, "corsPolicy": None, "additionalPortMappings": None},
             "secrets": ["microsoft-provider-authentication-secret"],
             "secret_value": "live",
-            "redirects": ["https://cardio.example.test/.auth/login/aad/callback"],
+            "application": {"id": "obj", "signInAudience": "AzureADMyOrg", "tags": ["hls-cardiology-app:sub/rg-test/cardioe2e-app"],
+                            "web": {"redirectUris": ["https://cardio.example.test/.auth/login/aad/callback"],
+                                    "implicitGrantSettings": {"enableAccessTokenIssuance": False, "enableIdTokenIssuance": True}}},
+            "owners": [],
             "sp": {"id": "sp", "appRoleAssignmentRequired": True},
             "pages": [{"value": [{"principalId": "deployer"}]}],
         }
 
-        def variant(**changes):
+        def variant(change):
             state = json.loads(json.dumps(good))
-            for key, value in changes.items():
-                state[key] = value
+            change(state)
             return state
 
-        extra_path = variant(auth={**good["auth"], "globalValidation": {**good["auth"]["globalValidation"], "excludedPaths": ["/api/health", "/api/admit"]}})
+        aad = lambda s: s["auth"]["identityProviders"]["azureActiveDirectory"]  # noqa: E731
+        weaker = [
+            ("extra anonymous path", lambda s: s["auth"]["globalValidation"].update(excludedPaths=["/api/health", "/api/admit"])),
+            ("unauthenticated allowed", lambda s: s["auth"]["globalValidation"].update(unauthenticatedClientAction="AllowAnonymous")),
+            ("redirects to another provider", lambda s: s["auth"]["globalValidation"].update(redirectToProvider="github")),
+            ("GitHub sign-in enabled", lambda s: s["auth"]["identityProviders"].update(gitHub={"registration": {"clientId": "gh"}})),
+            ("custom OIDC provider enabled", lambda s: s["auth"]["identityProviders"].update(customOpenIdConnectProviders={"idp": {"enabled": True}})),
+            ("extra token audience", lambda s: aad(s).setdefault("validation", {}).update(allowedAudiences=["api://someone-else"])),
+            ("foreign issuer", lambda s: aad(s)["registration"].update(openIdIssuer="https://sts.windows.net/other-tenant/")),
+            ("open post-login redirect", lambda s: s["auth"]["login"].update(allowedExternalRedirectUrls=["https://evil.example"])),
+            ("HTTPS not required", lambda s: s["auth"].update(httpSettings={"requireHttps": False})),
+            ("plain HTTP ingress", lambda s: s["ingress"].update(allowInsecure=True)),
+            ("CORS on ingress", lambda s: s["ingress"].update(corsPolicy={"allowedOrigins": ["*"], "allowCredentials": True})),
+            ("extra external port", lambda s: s["ingress"].update(additionalPortMappings=[{"external": True, "targetPort": 4317}])),
+            ("multi-tenant registration", lambda s: s["application"].update(signInAudience="AzureADMultipleOrgs")),
+            ("implicit access tokens", lambda s: s["application"]["web"]["implicitGrantSettings"].update(enableAccessTokenIssuance=True)),
+            ("owner tag missing", lambda s: s["application"].update(tags=[])),
+            ("owner tag of another group", lambda s: s["application"].update(tags=["hls-cardiology-app:sub/rg-other/cardioe2e-app"])),
+            ("another owner", lambda s: s.update(owners=["someone-else"])),
+        ]
         cases = [
             ("protected with exact policy", protected, good, {}, "pass"),
+            ("disabled GitHub provider is not a weakness", protected, variant(lambda s: s["auth"]["identityProviders"].update(gitHub={"enabled": False})), {}, "pass"),
+            ("deployer as sole owner", protected, variant(lambda s: s.update(owners=["deployer"])), {}, "pass"),
             ("auth off at the edge", {"/": (200, ""), "/api/activity": (200, "")}, good, {}, "fail"),
             ("another tenant's sign-in", {"/": (302, "https://login.microsoftonline.com/other/oauth2"), "/api/activity": (401, "")}, good, {}, "fail"),
             ("API excluded from auth", {"/": (302, sign_in), "/api/activity": (200, "")}, good, {}, "fail"),
             ("redirect names another client", {"/": (302, f"{authorize}?redirect_uri={callback}&client_id=stale"), "/api/activity": (401, "")}, good, {}, "fail"),
             ("redirect has no callback", {"/": (302, f"{authorize}?client_id=app"), "/api/activity": (401, "")}, good, {}, "fail"),
             ("malformed redirect", {"/": (302, "https://["), "/api/activity": (401, "")}, good, {}, "fail"),
-            ("callback secret missing", protected, variant(secrets=[]), {}, "fail"),
-            ("installed secret revoked", protected, variant(secret_value="revoked"), {}, "fail"),
-            ("empty auth output", protected, variant(auth=None), {}, "fail"),
-            ("callback path case differs", protected, variant(redirects=["https://cardio.example.test/.auth/login/aad/CALLBACK"]), {}, "fail"),
-            ("callback of another app", protected, variant(redirects=["https://prod.example.test/.auth/login/aad/callback"]), {}, "fail"),
-            ("callback plus another redirect", protected, variant(redirects=["https://cardio.example.test/.auth/login/aad/callback", "https://other.example.test/cb"]), {}, "fail"),
-            ("extra anonymous path", protected, extra_path, {}, "fail"),
-            ("assignment not required", protected, variant(sp={"id": "sp", "appRoleAssignmentRequired": False}), {}, "fail"),
-            ("removed user still assigned", protected, variant(pages=[{"value": [{"principalId": "deployer"}, {"principalId": "old"}]}]), {}, "fail"),
-            ("unwanted grant on page two", protected, variant(pages=[{"value": [{"principalId": "deployer"}], "@odata.nextLink": "next"}, {"value": [{"principalId": "old"}]}]), {}, "fail"),
+            ("callback secret missing", protected, variant(lambda s: s.update(secrets=[])), {}, "fail"),
+            ("installed secret revoked", protected, variant(lambda s: s.update(secret_value="revoked")), {}, "fail"),
+            ("empty auth output", protected, variant(lambda s: s.update(auth=None)), {}, "fail"),
+            ("callback path case differs", protected, variant(lambda s: s["application"]["web"].update(redirectUris=["https://cardio.example.test/.auth/login/aad/CALLBACK"])), {}, "fail"),
+            ("callback of another app", protected, variant(lambda s: s["application"]["web"].update(redirectUris=["https://prod.example.test/.auth/login/aad/callback"])), {}, "fail"),
+            ("callback plus another redirect", protected, variant(lambda s: s["application"]["web"]["redirectUris"].append("https://other.example.test/cb")), {}, "fail"),
+            ("assignment not required", protected, variant(lambda s: s.update(sp={"id": "sp", "appRoleAssignmentRequired": False})), {}, "fail"),
+            ("removed user still assigned", protected, variant(lambda s: s.update(pages=[{"value": [{"principalId": "deployer"}, {"principalId": "old"}]}])), {}, "fail"),
+            ("unwanted grant on page two", protected, variant(lambda s: s.update(pages=[{"value": [{"principalId": "deployer"}], "@odata.nextLink": "next"}, {"value": [{"principalId": "old"}]}])), {}, "fail"),
             ("requested user not assigned", protected, good, {"cardiology_app_users": ["new@example.test"]}, "fail"),
+            *[(label, protected, variant(change), {}, "fail") for label, change in weaker],
         ]
         for label, responses, state, extra_config, expected in cases:
             pages = iter(state["pages"])
@@ -427,10 +456,13 @@ class DeploymentValidationTests(unittest.TestCase):
                     return _AzResult(_CARDIOLOGY_APP_LIST)
                 if args[1:4] == ["containerapp", "secret", "show"]:
                     return _AzResult(json.dumps(state["secret_value"]))
+                if args[1:4] == ["ad", "app", "owner"]:
+                    return _AzResult(json.dumps(state["owners"]))
                 payload = {
                     ("containerapp", "auth"): lambda: state["auth"],
+                    ("containerapp", "show"): lambda: state["ingress"],
                     ("containerapp", "secret"): lambda: state["secrets"],
-                    ("ad", "app"): lambda: state["redirects"],
+                    ("ad", "app"): lambda: state["application"],
                     ("ad", "sp"): lambda: state["sp"],
                     ("rest", "--method"): lambda: next(pages),
                     ("ad", "signed-in-user"): lambda: "deployer",
@@ -438,7 +470,7 @@ class DeploymentValidationTests(unittest.TestCase):
                 }[(args[1], args[2])]()
                 return _AzResult("" if payload is None else json.dumps(payload))
 
-            config = {"resource_group_name": "rg-test", "expected_tenant_id": tenant, **extra_config}
+            config = {"resource_group_name": "rg-test", "expected_tenant_id": tenant, "expected_subscription_id": "sub", **extra_config}
             with self.subTest(label), patch(
                 "shared.deployment_validation._unauthenticated_response",
                 side_effect=lambda fqdn, path, browser, r=responses: r[path],
