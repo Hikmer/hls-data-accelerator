@@ -204,7 +204,8 @@ $secret = (Invoke-Az @("ad", "app", "credential", "reset", "--id", $appId, "--di
     "--years", "1", "--query", "password", "-o", "tsv")).Out.Trim()
 try {
     Invoke-Az @("containerapp", "auth", "microsoft", "update", "-g", $ResourceGroupName, "-n", $appName,
-        "--client-id", $appId, "--client-secret", $secret, "--tenant-id", $ExpectedTenantId,
+        "--client-id", $appId, "--client-secret", $secret,
+        # The v2 issuer names the tenant; the CLI rejects --tenant-id alongside it.
         "--issuer", "https://login.microsoftonline.com/$ExpectedTenantId/v2.0", "--yes", "-o", "none") | Out-Null
 } finally { $secret = $null }
 Invoke-Az @("containerapp", "auth", "update", "-g", $ResourceGroupName, "-n", $appName, "--enabled", "true",
@@ -215,20 +216,32 @@ Write-Host "  ✓ Entra sign-in enforced" -ForegroundColor Green
 # ── Readiness gate ───────────────────────────────────────────────────────────
 $deadline = (Get-Date).AddMinutes(5)
 $healthOk = $false; $authOk = $false; $lastProblem = ""
-while ((Get-Date) -lt $deadline -and -not ($healthOk -and $authOk)) {
-    try {
-        $health = Invoke-RestMethod -Uri "$appUrl/api/health" -TimeoutSec 15
-        $healthOk = $health.status -eq "ok" -and $health.profile -eq "live" -and $health.revision -eq $tag
-        if (-not $healthOk) { $lastProblem = "health reported status=$($health.status) profile=$($health.profile) revision=$($health.revision)" }
-    } catch { $lastProblem = "health: $($_.Exception.Message)" }
-    try {
-        $page = Invoke-WebRequest -Uri "$appUrl/" -MaximumRedirection 0 -SkipHttpErrorCheck -TimeoutSec 15
-        $location = [string]($page.Headers["Location"] | Select-Object -First 1)
-        $authOk = $page.StatusCode -in @(302, 401) -and ($location -match "/\.auth/login/aad|login\.microsoftonline\.com")
-        if (-not $authOk) { $lastProblem = "unauthenticated / returned $($page.StatusCode) (Location '$location')" }
-    } catch { $lastProblem = "sign-in probe: $($_.Exception.Message)" }
-    if (-not ($healthOk -and $authOk)) { Start-Sleep -Seconds 10 }
-}
+# Easy Auth redirects only browser requests (others get 401), so probe as one,
+# without following the redirect, and require it to land on this tenant's sign-in.
+$handler = [System.Net.Http.HttpClientHandler]::new()
+$handler.AllowAutoRedirect = $false
+$browser = [System.Net.Http.HttpClient]::new($handler)
+$browser.Timeout = [TimeSpan]::FromSeconds(15)
+$browser.DefaultRequestHeaders.UserAgent.ParseAdd("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0 Safari/537.36")
+$browser.DefaultRequestHeaders.Accept.ParseAdd("text/html,application/xhtml+xml")
+$signIn = "https://login.microsoftonline.com/$ExpectedTenantId/"
+try {
+    while ((Get-Date) -lt $deadline -and -not ($healthOk -and $authOk)) {
+        try {
+            $health = Invoke-RestMethod -Uri "$appUrl/api/health" -TimeoutSec 15
+            $healthOk = $health.status -eq "ok" -and $health.profile -eq "live" -and $health.revision -eq $tag
+            if (-not $healthOk) { $lastProblem = "health reported status=$($health.status) profile=$($health.profile) revision=$($health.revision)" }
+        } catch { $lastProblem = "health: $($_.Exception.Message)" }
+        try {
+            $response = $browser.GetAsync("$appUrl/").GetAwaiter().GetResult()
+            $location = if ($response.Headers.Location) { $response.Headers.Location.AbsoluteUri } else { "" }
+            $authOk = [int]$response.StatusCode -eq 302 -and $location.StartsWith($signIn) -and $location.Contains("client_id=$appId")
+            if (-not $authOk) { $lastProblem = "unauthenticated browser request to / returned $([int]$response.StatusCode) (Location '$location')" }
+            $response.Dispose()
+        } catch { $lastProblem = "sign-in probe: $($_.Exception.Message)" }
+        if (-not ($healthOk -and $authOk)) { Start-Sleep -Seconds 10 }
+    }
+} finally { $browser.Dispose() }
 if (-not ($healthOk -and $authOk)) { throw "Cardiology app did not become ready at $appUrl within 5 minutes: $lastProblem" }
 
 Write-Host "  ✓ $appUrl healthy on revision $tag; unauthenticated visitors are sent to sign-in" -ForegroundColor Green
