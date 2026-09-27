@@ -149,11 +149,15 @@ export interface DeploymentConfig {
   skip_graph_agent: boolean;
   payer_ops_email: string;
   claim_event_rate_per_minute: number;
+  skip_cardiology_app: boolean;
+  cardiology_app_path: string;
+  cardiology_app_users: string[];
   source_resource_group?: string;
   phase2_only?: boolean;
   phase3_only?: boolean;
   phase4_only?: boolean;
   phase7_only?: boolean;
+  phase8_only?: boolean;
   continue_from_instance_id?: string;
 }
 
@@ -371,6 +375,23 @@ export async function validateRun(instanceId: string, teardown = false): Promise
 
 export async function continuePhase7(instanceId: string): Promise<{ instanceId: string; statusUrl: string }> {
   return requestJson(`${API_BASE}/deploy/${encodeURIComponent(instanceId)}/continue-phase7`, { method: "POST", timeoutMs: 30000 });
+}
+
+export interface Phase8ContinuationBody {
+  cardiology_app_path?: string;
+  cardiology_app_users?: string[];
+}
+
+export async function continuePhase8(
+  instanceId: string,
+  body?: Phase8ContinuationBody
+): Promise<{ instanceId: string; statusUrl: string }> {
+  return requestJson(`${API_BASE}/deploy/${encodeURIComponent(instanceId)}/continue-phase8`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body ?? {}),
+    timeoutMs: 30000,
+  });
 }
 
 export async function getLive(): Promise<LiveStatus> {

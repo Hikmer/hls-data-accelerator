@@ -54,6 +54,7 @@ import {
   getCloudState,
   validateRun,
   continuePhase7,
+  continuePhase8,
   type DeploymentStatus,
   type DeploymentConfig,
   type PhaseInfo,
@@ -465,6 +466,7 @@ const ALL_PHASES: PhaseInfo[] = [
   { id: "phase_5_alerts", phase: "5. Bedside Alerting & Action: Real-Time Reflex alerts", status: "pending", milestone: 5 },
   { id: "phase_6_quality", phase: "6. Population Health & Quality: Full analytics pipeline", status: "pending", milestone: 6 },
   { id: "phase_7_payer_ops", phase: "7. Payer RTI & Ops: Claim stream, scoring, activator, and agents", status: "pending", milestone: 7 },
+  { id: "phase_8_cardiology_app", phase: "Phase 8: Cardiology App", status: "pending", milestone: 8 },
 ];
 
 export function PhaseMonitor() {
@@ -507,6 +509,7 @@ export function PhaseMonitor() {
   const [validation, setValidation] = useState<ValidationResult | null>(null);
   const [validating, setValidating] = useState(false);
   const [continuingPhase7, setContinuingPhase7] = useState(false);
+  const [continuingPhase8, setContinuingPhase8] = useState(false);
   const [hasAutoExported, setHasAutoExported] = useState(false);
   const afterActionCardRef = useRef<HTMLDivElement>(null);
 
@@ -686,6 +689,20 @@ export function PhaseMonitor() {
     }
   };
 
+  const runPhase8Continuation = async () => {
+    if (!instanceId) return;
+    setContinuingPhase8(true);
+    setError("");
+    try {
+      const result = await continuePhase8(instanceId);
+      navigate(`/monitor/${result.instanceId}`);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Unable to start Phase 8 continuation");
+    } finally {
+      setContinuingPhase8(false);
+    }
+  };
+
   // Track completion of a new active deployment and auto-open report if auto-export is selected
   useEffect(() => {
     if (isComplete && !isTeardown && status?.runtimeStatus === "Completed" && !hasAutoExported) {
@@ -770,6 +787,17 @@ export function PhaseMonitor() {
   // Get logs from backend customStatus.logs (for real deployments).
   // Backend phase values are strings for local FastAPI runs and may be numeric in older persisted runs.
   const backendLogs = (status?.customStatus as Record<string, unknown>)?.logs as Array<{timestamp: string; level: string; message: string; phase?: string | number}> | undefined;
+
+  // Phase 8 prints `CARDIOLOGY_APP_URL=https://<fqdn>` once on success; surface the
+  // most recent one as a link on the Phase 8 card.
+  const cardiologyAppUrl = (() => {
+    if (!backendLogs) return "";
+    for (let i = backendLogs.length - 1; i >= 0; i--) {
+      const match = backendLogs[i].message.match(/CARDIOLOGY_APP_URL=(https:\/\/\S+)/);
+      if (match) return match[1];
+    }
+    return "";
+  })();
 
   // Drilldown log filtering
   const errorLogs = (backendLogs ?? []).filter(
@@ -1064,6 +1092,7 @@ export function PhaseMonitor() {
     { label: "5. Bedside Alerting & Action", shortLabel: "Alerts", phaseIndices: [11], namePatterns: ["Activator", "Reflex"], position: 75, endWeight: 77, phaseNumber: 5 },
     { label: "6. Population Health & Quality", shortLabel: "Quality", phaseIndices: [12], namePatterns: ["Quality", "Claims", "CMS", "Scorecard", "PDC", "Adherence", "HCC", "RAF", "Readmission", "Utilization", "PMPM", "Star Rating"], position: 92, endWeight: 89, phaseNumber: 6 },
     { label: "7. Payer RTI & Ops", shortLabel: "Payer Ops", phaseIndices: [13], namePatterns: ["Payer", "Fraud", "HighCost", "CareGap", "claim-stream", "PayerOps", "HealthcareOpsAgent", "Graph Agent"], position: 98, endWeight: 97, phaseNumber: 7 },
+    { label: "8. Cardiology App", shortLabel: "Cardiology", phaseIndices: [14], namePatterns: ["Cardiology App", "Cardiology"], position: 99, endWeight: 99, phaseNumber: 8 },
   ];
 
   // ── Adaptive milestones: determine active milestones from instance ID ──
@@ -1074,7 +1103,7 @@ export function PhaseMonitor() {
     const id = instanceId ?? "";
     const pMatch = id.match(/^P(\d+)-/i);
     const idMilestones = pMatch
-      ? new Set(pMatch[1].split("").map(Number).filter((n) => n >= 1 && n <= 7))
+      ? new Set(pMatch[1].split("").map(Number).filter((n) => n >= 1 && n <= 8))
       : null;
 
     // Overrule legacy IDs if we have the rich deployment config saved, but do
@@ -1092,6 +1121,7 @@ export function PhaseMonitor() {
       if (!deployConfig.skip_activator) set.add(5);
       if (!deployConfig.skip_quality_measures) set.add(6);
       if (!deployConfig.skip_phase7) set.add(7);
+      if (!deployConfig.skip_cardiology_app) set.add(8);
       if (set.has(5) && !set.has(6)) set.add(6);
       return set;
     }
@@ -1124,6 +1154,11 @@ export function PhaseMonitor() {
   if (!isTeardown && activeMilestoneNumbers.has(7) && !phases.some((p) => /payer|claim-stream|healthcareopsagent|graph agent/i.test(p.phase))) {
     phases = [...phases, { phase: "7. Payer RTI & Ops: Claim stream, scoring, activator, and agents", status: "pending", milestone: 7 }];
   }
+  // Phase 8 is independent of Fabric and may be the only selected workload; keep
+  // its card visible when it was selected but has not emitted a step yet.
+  if (!isTeardown && activeMilestoneNumbers.has(8) && !phases.some((p) => /cardiology app|phase 8/i.test(p.phase))) {
+    phases = [...phases, { phase: "Phase 8: Cardiology App", status: "pending", milestone: 8 }];
+  }
 
   const cleanPhaseName = (name: string) => name.toLowerCase()
     .replace(/^(phase\s*\d+:|\d+[a-z]?\.\s*[^:]+:)/i, "")
@@ -1135,6 +1170,7 @@ export function PhaseMonitor() {
     if (phase.phase === template.phase) return true;
     if (template.id === "phase_5_alerts" && /phase\s*5|data activator|clinicalalertactivator|reflex/i.test(phase.phase)) return true;
     if (template.id === "phase_7_payer_ops" && /payer|claim-stream|healthcareopsagent|graph agent/i.test(phase.phase)) return true;
+    if (template.id === "phase_8_cardiology_app" && /cardiology app|phase 8/i.test(phase.phase)) return true;
 
     const pClean = cleanPhaseName(phase.phase);
     const templateClean = cleanPhaseName(template.phase);
@@ -1197,6 +1233,8 @@ export function PhaseMonitor() {
         return deployConfig.skip_quality_measures;
       case "phase_7_payer_ops":
         return deployConfig.skip_phase7;
+      case "phase_8_cardiology_app":
+        return deployConfig.skip_cardiology_app;
       default:
         return false;
     }
@@ -2253,6 +2291,9 @@ export function PhaseMonitor() {
               {!isTeardown && status.runtimeStatus === "Completed" && !(status.output?.phases ?? []).some((p) => /PHASE 7|PAYER RTI/i.test(p.phase)) && (
                 <Button size="small" appearance="primary" onClick={runPhase7Continuation} disabled={continuingPhase7}>{continuingPhase7 ? "Starting Phase 7…" : "Run missing Phase 7"}</Button>
               )}
+              {!isTeardown && status.runtimeStatus === "Completed" && !(status.output?.phases ?? []).some((p) => /cardiology app|phase 8/i.test(p.phase)) && (
+                <Button size="small" appearance="primary" onClick={runPhase8Continuation} disabled={continuingPhase8}>{continuingPhase8 ? "Starting Phase 8…" : "Run Phase 8"}</Button>
+              )}
             </div>
             {validation && (
               <div style={{ display: "grid", gap: 4 }}>
@@ -2375,11 +2416,26 @@ export function PhaseMonitor() {
             } else {
               filteredLogs = [];
             }
+            const phaseForCard = phase.id === "phase_8_cardiology_app" && cardiologyAppUrl
+              ? {
+                  ...phase,
+                  subSteps: [
+                    ...(phase.subSteps ?? []),
+                    {
+                      name: "Cardiology app",
+                      status: "succeeded" as const,
+                      detail: cardiologyAppUrl,
+                      updatedAt: "",
+                      url: cardiologyAppUrl,
+                    },
+                  ],
+                }
+              : phase;
 
             return (
               <PhaseCard
                 key={phase.phase}
-                phase={phase}
+                phase={phaseForCard}
                 logs={filteredLogs}
                 autoScroll={autoScroll}
                 instanceId={instanceId}
