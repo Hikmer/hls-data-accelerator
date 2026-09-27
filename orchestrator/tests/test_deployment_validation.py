@@ -315,6 +315,18 @@ class DeploymentValidationTests(unittest.TestCase):
         self.assertEqual([check["name"] for check in presence], ["Cardiology app Container App"])
         self.assertEqual(presence[0]["status"], "pass")
 
+    def test_a_reused_cardiology_app_is_still_validated(self) -> None:
+        """Resume skips redeploying a verified app but must not drop its checks."""
+        resources = {"workspace": {"id": "ws"}, "fabric": [], "azure": []}
+        base = {"skip_fabric": True, "skip_hds_pipelines": True, "skip_data_agents": True, "skip_imaging": True,
+                "skip_ontology": True, "skip_activator": True, "skip_quality_measures": True, "skip_phase7": True}
+        reused = effective_validation_config({**base, "skip_cardiology_app": True, "cardiology_app_reused": True})
+        self.assertEqual([c["name"] for c in feature_presence_checks(resources, reused)], ["Cardiology app Container App"])
+
+        # A phase-only run cloned from that config does not inherit the reuse flag.
+        phase7 = effective_validation_config({**base, "phase7_only": True, "cardiology_app_reused": True})
+        self.assertNotIn("Cardiology app Container App", [c["name"] for c in feature_presence_checks(resources, phase7)])
+
     def test_cardiology_health_passes_on_a_built_live_revision(self) -> None:
         captured: list[list[str]] = []
 

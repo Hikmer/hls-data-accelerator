@@ -270,6 +270,7 @@ from shared.deployment_validation import (
     CARDIOLOGY_WORKLOAD_VALUE,
     cardiology_app_check,
     cardiology_app_resources,
+    cardiology_sign_in_check,
     effective_validation_config,
     feature_presence_checks,
     runtime_feature_checks,
@@ -718,6 +719,8 @@ class DeployRequest(BaseModel):
     payer_ops_email: str = ""
     claim_event_rate_per_minute: int = 60
     skip_cardiology_app: bool = False
+    # Set by resume when a verified app is reused; validation still checks it.
+    cardiology_app_reused: bool = False
     cardiology_app_path: str = ""
     cardiology_app_users: list[str] = []
     dicom_toolkit_path: str = ""
@@ -1586,7 +1589,11 @@ def _phase_live_prerequisites_ok(req: DeployRequest, phase_name: str, evidence: 
         health = cardiology_app_check(req.model_dump(), _az_run)
         if health["status"] != "pass":
             return (False, f"Cardiology app health check failed: {health['detail']}")
-        return (True, f"Cardiology app verified: {health['detail']}")
+        # A healthy but unprotected app must be redeployed, not reused.
+        sign_in = cardiology_sign_in_check(req.model_dump(), _az_run)
+        if sign_in["status"] != "pass":
+            return (False, f"Cardiology app sign-in check failed: {sign_in['detail']}")
+        return (True, f"Cardiology app verified: {health['detail']}; {sign_in['detail']}")
 
     return (True, "No extra live prerequisite check required")
 
@@ -1694,7 +1701,9 @@ def _apply_success_skips_from_deployment(req: DeployRequest, prior_deploy: dict,
         elif "CMS QUALITY" in phase_name:
             req.skip_quality_measures = True
         elif "CARDIOLOGY APP" in phase_name:
+            # Reused, not deselected: completion validation still checks it.
             req.skip_cardiology_app = True
+            req.cardiology_app_reused = True
         else:
             continue
         applied = True

@@ -54,8 +54,12 @@ def cardiology_app_resources(azure_resources: list[dict[str, Any]]) -> list[dict
 
 
 def cardiology_app_expected(config: dict[str, Any]) -> bool:
-    """Phase 8 runs in a full deploy unless skipped, and in phase8-only mode."""
-    if config.get("phase8_only"):
+    """Phase 8 runs in a full deploy unless skipped, and in phase8-only mode.
+
+    A resumed run that reused a verified app (cardiology_app_reused) skips the
+    deployment but still validates the app it relies on.
+    """
+    if config.get("phase8_only") or config.get("cardiology_app_reused"):
         return True
     if config.get("skip_cardiology_app", False):
         return False
@@ -93,6 +97,7 @@ def effective_validation_config(config: dict[str, Any]) -> dict[str, Any]:
     effective = dict(config)
     if any(effective.get(field) for field in ("phase2_only", "phase3_only", "phase4_only", "phase7_only", "phase8_only")):
         effective["continue_from_instance_id"] = ""
+        effective["cardiology_app_reused"] = False
     if effective.get("phase2_only"):
         effective.update(skip_data_agents=True, skip_imaging=True, skip_ontology=True, skip_activator=True, skip_quality_measures=True, skip_phase7=True, skip_cardiology_app=True)
     elif effective.get("phase3_only"):

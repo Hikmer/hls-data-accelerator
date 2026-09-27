@@ -135,23 +135,34 @@ $acrName = (Invoke-Az @("acr", "list", "-g", $ResourceGroupName, "--query", $acr
 if (-not $acrName) { throw "The cardiology app registry was not found in $ResourceGroupName." }
 Write-Host "  ✓ Infrastructure ready (registry $acrName)" -ForegroundColor Green
 
-# ── Image ────────────────────────────────────────────────────────────────────
-# $builtTags, not $tags: PowerShell names are case-insensitive and $Tags is the resource-tag parameter.
-$builtTags = Invoke-Az @("acr", "repository", "show-tags", "-n", $acrName, "--repository", $ImageRepo, "-o", "tsv") -AllowFailure
-if ($builtTags.Code -eq 0 -and ($builtTags.Out -split "`n") -contains $tag) {
-    Write-Host "  = Image ${ImageRepo}:$tag already built" -ForegroundColor Gray
-} else {
-    Write-Host "  Building ${ImageRepo}:$tag in $acrName (a few minutes)..." -ForegroundColor Gray
-    & az acr build --registry $acrName --image "${ImageRepo}:$tag" --file (Join-Path $CardiologyAppPath "Dockerfile") $CardiologyAppPath --only-show-errors
-    if ($LASTEXITCODE -ne 0) { throw "az acr build failed for ${ImageRepo}:$tag." }
-    Write-Host "  ✓ Built ${ImageRepo}:$tag" -ForegroundColor Green
+# An existing cardiology revision must never be served without sign-in. If the
+# app runs the real image but its auth config is not enforcing (an earlier run
+# failed part-way), take it offline before any other work.
+$quarantined = $false
+if ($hasRegistryImage) {
+    $authShow = Invoke-Az @("containerapp", "auth", "show", "-g", $ResourceGroupName, "-n", $appName, "-o", "json") -AllowFailure
+    $enforcing = $false
+    try {
+        $cfg = $authShow.Out | ConvertFrom-Json
+        $enforcing = $cfg.platform.enabled -eq $true -and $cfg.globalValidation.unauthenticatedClientAction -eq "RedirectToLoginPage"
+    } catch { $enforcing = $false }
+    if (-not $enforcing) {
+        $activeRevisions = (Invoke-Az @("containerapp", "revision", "list", "-g", $ResourceGroupName, "-n", $appName,
+            "--query", "[?properties.active].name", "-o", "tsv")).Out -split "`n" | Where-Object { $_ }
+        foreach ($revisionName in $activeRevisions) {
+            Invoke-Az @("containerapp", "revision", "deactivate", "-g", $ResourceGroupName, "-n", $appName, "--revision", $revisionName, "-o", "none") | Out-Null
+        }
+        $quarantined = $true
+        Write-Host "  ! $appName was serving without sign-in; its revisions are offline until sign-in is enforced" -ForegroundColor Yellow
+    }
 }
 
+
 # ── Entra sign-in, enforced BEFORE the app image is served ───────────────────
-# Until sign-in is verified the app keeps serving what it served before: the
-# public placeholder on a fresh deployment, or the previous signed-in revision on
-# a rerun. The cardiology app itself is never reachable anonymously, including
-# when any step below fails.
+# Until sign-in is verified the app serves only what it served before: the
+# public placeholder on a fresh deployment, the previous signed-in revision on a
+# rerun, or nothing if it was quarantined above. The cardiology app itself is
+# never reachable anonymously, including when any step below fails.
 $fqdn = (Invoke-Az @("containerapp", "show", "-g", $ResourceGroupName, "-n", $appName,
     "--query", "properties.configuration.ingress.fqdn", "-o", "tsv")).Out.Trim()
 if (-not $fqdn) { throw "$appName has no ingress FQDN." }
@@ -181,7 +192,17 @@ foreach ($upn in $CardiologyAppUsers | Where-Object { $_ }) {
 }
 $allowed = @($allowed | Select-Object -Unique)
 $assignmentsUrl = "https://graph.microsoft.com/v1.0/servicePrincipals/$spId/appRoleAssignedTo"
-$existingAssignments = @(((Invoke-Az @("rest", "--method", "GET", "--url", $assignmentsUrl, "-o", "json")).Out | ConvertFrom-Json).value)
+# Graph pages this collection; follow @odata.nextLink so no grant is missed.
+function Get-AppAssignments {
+    $all = @(); $url = $assignmentsUrl
+    while ($url) {
+        $page = (Invoke-Az @("rest", "--method", "GET", "--url", $url, "-o", "json")).Out | ConvertFrom-Json
+        $all += @($page.value)
+        $url = if ($page.PSObject.Properties["@odata.nextLink"]) { $page."@odata.nextLink" } else { $null }
+    }
+    return ,$all
+}
+$existingAssignments = Get-AppAssignments
 foreach ($assignment in $existingAssignments | Where-Object { $allowed -notcontains $_.principalId }) {
     Invoke-Az @("rest", "--method", "DELETE", "--url", "$assignmentsUrl/$($assignment.id)", "-o", "none") | Out-Null
 }
@@ -194,8 +215,7 @@ foreach ($principal in $allowed | Where-Object { $currentPrincipals -notcontains
             "--headers", "Content-Type=application/json", "--body", "@$bodyFile", "-o", "none") | Out-Null
     } finally { Remove-Item $bodyFile -ErrorAction SilentlyContinue }
 }
-$verified = @(((Invoke-Az @("rest", "--method", "GET", "--url", $assignmentsUrl, "-o", "json")).Out | ConvertFrom-Json).value |
-    ForEach-Object { $_.principalId } | Sort-Object -Unique)
+$verified = @(Get-AppAssignments | ForEach-Object { $_ } | ForEach-Object { $_.principalId } | Sort-Object -Unique)
 if (($verified -join ",") -ne (@($allowed | Sort-Object) -join ",")) { throw "App assignments do not match the requested sign-in accounts." }
 Write-Host "  ✓ Sign-in limited to $($verified.Count) assigned account(s)" -ForegroundColor Green
 
@@ -233,12 +253,35 @@ function Test-SignInEnforced {
 }
 
 try {
-    $deadline = (Get-Date).AddMinutes(5)
-    $problem = Test-SignInEnforced
-    while ($problem -and (Get-Date) -lt $deadline) { Start-Sleep -Seconds 10; $problem = Test-SignInEnforced }
-    if ($problem) { throw "Sign-in was not enforced within 5 minutes; the app image was not published: $problem" }
+    # Control plane first: the auth config itself must be enforcing, for this
+    # app registration, with only /api/health anonymous.
+    $cfg = (Invoke-Az @("containerapp", "auth", "show", "-g", $ResourceGroupName, "-n", $appName, "-o", "json")).Out | ConvertFrom-Json
+    $excluded = @($cfg.globalValidation.excludedPaths) -join ","
+    if (-not ($cfg.platform.enabled -eq $true -and $cfg.globalValidation.unauthenticatedClientAction -eq "RedirectToLoginPage" -and
+              $cfg.identityProviders.azureActiveDirectory.registration.clientId -eq $appId -and $excluded -eq "/api/health")) {
+        throw "Container Apps auth is not enforcing sign-in for $appId (excluded paths: '$excluded'); the app image was not published."
+    }
+    # Then the live edge, unless quarantined (no active revision answers).
+    if (-not $quarantined) {
+        $deadline = (Get-Date).AddMinutes(5)
+        $problem = Test-SignInEnforced
+        while ($problem -and (Get-Date) -lt $deadline) { Start-Sleep -Seconds 10; $problem = Test-SignInEnforced }
+        if ($problem) { throw "Sign-in was not enforced within 5 minutes; the app image was not published: $problem" }
+    }
     Write-Host "  ✓ Entra sign-in enforced" -ForegroundColor Green
 
+
+# ── Image ────────────────────────────────────────────────────────────────────
+# $builtTags, not $tags: PowerShell names are case-insensitive and $Tags is the resource-tag parameter.
+$builtTags = Invoke-Az @("acr", "repository", "show-tags", "-n", $acrName, "--repository", $ImageRepo, "-o", "tsv") -AllowFailure
+if ($builtTags.Code -eq 0 -and ($builtTags.Out -split "`n") -contains $tag) {
+    Write-Host "  = Image ${ImageRepo}:$tag already built" -ForegroundColor Gray
+} else {
+    Write-Host "  Building ${ImageRepo}:$tag in $acrName (a few minutes)..." -ForegroundColor Gray
+    & az acr build --registry $acrName --image "${ImageRepo}:$tag" --file (Join-Path $CardiologyAppPath "Dockerfile") $CardiologyAppPath --only-show-errors
+    if ($LASTEXITCODE -ne 0) { throw "az acr build failed for ${ImageRepo}:$tag." }
+    Write-Host "  ✓ Built ${ImageRepo}:$tag" -ForegroundColor Green
+}
     # ── App revision (role assignments can take a minute to reach the pull) ──
     $loginServer = (Invoke-Az @("acr", "show", "-n", $acrName, "--query", "loginServer", "-o", "tsv")).Out.Trim()
     for ($attempt = 1; $attempt -le 3; $attempt++) {
