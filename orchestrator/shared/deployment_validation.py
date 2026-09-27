@@ -6,6 +6,7 @@ import base64
 import http.client
 import json
 import re
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -382,36 +383,46 @@ def _az_json(az_run: Callable[..., Any], args: list[str], expected: type) -> Any
     return value
 
 
+def _token_issued(tenant: str, body: bytes, timeout: float) -> bool:
+    request = urllib.request.Request(f"https://login.microsoftonline.com/{tenant}/oauth2/v2.0/token", data=body)
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            return response.status == 200 and "access_token" in json.load(response)
+    except (OSError, ValueError):  # URLError/HTTPError/timeouts are OSError; bad JSON is ValueError
+        return False
+
+
 def _client_secret_authenticates(tenant: str, client_id: str, secret: str, window: float = 30.0) -> bool:
     """Only a live secret for this app gets a client-credentials token.
 
     Entra replicates credential changes gradually and, for minutes after one,
     refuses a valid secret intermittently (AADSTS7000215): one token proves the
-    secret; refusal counts only when it persists for `window` seconds (probes
-    5 s apart, each capped at 10 s and at the time left).
+    secret; refusal counts only when it persists for `window` seconds. Each probe
+    runs on a daemon thread joined for at most the time left, so resolution,
+    connection, and a slow body cannot overrun the window; a late answer is ignored.
     """
     body = urllib.parse.urlencode({"client_id": client_id, "client_secret": secret, "grant_type": "client_credentials",
                                    "scope": "https://graph.microsoft.com/.default"}).encode()
     deadline = time.monotonic() + window
     while (left := deadline - time.monotonic()) > 0:
-        request = urllib.request.Request(f"https://login.microsoftonline.com/{tenant}/oauth2/v2.0/token", data=body)
-        try:
-            with urllib.request.urlopen(request, timeout=min(10.0, left)) as response:
-                if response.status == 200 and "access_token" in json.load(response):
-                    return True
-        except (urllib.error.URLError, TimeoutError, json.JSONDecodeError):
-            pass
+        issued: list[bool] = []
+        budget = min(10.0, left)
+        probe = threading.Thread(target=lambda out=issued, t=budget: out.append(_token_issued(tenant, body, t)), daemon=True)
+        probe.start()
+        probe.join(budget)
+        if issued and issued[0]:
+            return True
         time.sleep(max(0.0, min(5.0, deadline - time.monotonic())))
     return False
 
 
-def _cardiology_auth_config_problem(config: dict[str, Any], app_name: str, az_run: Callable[..., Any]) -> str:
+def _cardiology_auth_config_problem(config: dict[str, Any], app_name: str, fqdn: str, az_run: Callable[..., Any]) -> str:
     """The control-plane access policy the deployment script establishes.
 
     Redirect every unauthenticated request except /api/health, hold a client
     secret that authenticates as the app (the callback redeems codes with it),
-    require app assignment, and assign exactly the deploying user plus
-    cardiology_app_users.
+    register this app's exact (case-sensitive) callback, require app assignment,
+    and assign exactly the deploying user plus cardiology_app_users.
     """
     scope = ["-g", str(config.get("resource_group_name") or ""), "-n", app_name]
     if config.get("expected_subscription_id"):
@@ -432,7 +443,11 @@ def _cardiology_auth_config_problem(config: dict[str, Any], app_name: str, az_ru
         if not _client_secret_authenticates(str(config.get("expected_tenant_id") or ""), str(registration.get("clientId")), secret):
             return "the installed client secret does not authenticate as the app"
 
-        sp = _az_json(az_run, ["az", "ad", "sp", "show", "--id", str(registration.get("clientId"))], dict)
+        client_id = str(registration.get("clientId"))
+        callback = f"https://{fqdn}/.auth/login/aad/callback"
+        if callback not in _az_json(az_run, ["az", "ad", "app", "show", "--id", client_id, "--query", "web.redirectUris"], list):
+            return f"registration does not list the callback {callback}"
+        sp = _az_json(az_run, ["az", "ad", "sp", "show", "--id", client_id], dict)
         if sp.get("appRoleAssignmentRequired") is not True:
             return "app assignment is not required"
         assigned: set[str] = set()
@@ -464,7 +479,7 @@ def cardiology_sign_in_check(config: dict[str, Any], az_run: Callable[..., Any])
     except Exception as exc:
         return _check(CARDIOLOGY_SIGN_IN_CHECK_NAME, False, f"{type(exc).__name__}: {exc}")
     redirected = page_status == 302 and location.startswith(f"https://login.microsoftonline.com/{tenant}/")
-    policy_problem = _cardiology_auth_config_problem(config, app_name, az_run)
+    policy_problem = _cardiology_auth_config_problem(config, app_name, fqdn, az_run)
     return _check(CARDIOLOGY_SIGN_IN_CHECK_NAME, redirected and api_status == 401 and not policy_problem,
                   f"browser / -> {page_status} {location[:80]}; anonymous /api/activity -> {api_status}"
                   + (f"; {policy_problem}" if policy_problem else ""))

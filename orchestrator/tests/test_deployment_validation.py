@@ -385,6 +385,7 @@ class DeploymentValidationTests(unittest.TestCase):
                      "identityProviders": {"azureActiveDirectory": {"registration": {"clientId": "app", "clientSecretSettingName": "microsoft-provider-authentication-secret"}}}},
             "secrets": ["microsoft-provider-authentication-secret"],
             "secret_value": "live",
+            "redirects": ["https://cardio.example.test/.auth/login/aad/callback"],
             "sp": {"id": "sp", "appRoleAssignmentRequired": True},
             "pages": [{"value": [{"principalId": "deployer"}]}],
         }
@@ -404,6 +405,8 @@ class DeploymentValidationTests(unittest.TestCase):
             ("callback secret missing", protected, variant(secrets=[]), {}, "fail"),
             ("installed secret revoked", protected, variant(secret_value="revoked"), {}, "fail"),
             ("empty auth output", protected, variant(auth=None), {}, "fail"),
+            ("callback path case differs", protected, variant(redirects=["https://cardio.example.test/.auth/login/aad/CALLBACK"]), {}, "fail"),
+            ("callback of another app", protected, variant(redirects=["https://prod.example.test/.auth/login/aad/callback"]), {}, "fail"),
             ("extra anonymous path", protected, extra_path, {}, "fail"),
             ("assignment not required", protected, variant(sp={"id": "sp", "appRoleAssignmentRequired": False}), {}, "fail"),
             ("removed user still assigned", protected, variant(pages=[{"value": [{"principalId": "deployer"}, {"principalId": "old"}]}]), {}, "fail"),
@@ -421,6 +424,7 @@ class DeploymentValidationTests(unittest.TestCase):
                 payload = {
                     ("containerapp", "auth"): lambda: state["auth"],
                     ("containerapp", "secret"): lambda: state["secrets"],
+                    ("ad", "app"): lambda: state["redirects"],
                     ("ad", "sp"): lambda: state["sp"],
                     ("rest", "--method"): lambda: next(pages),
                     ("ad", "signed-in-user"): lambda: "deployer",

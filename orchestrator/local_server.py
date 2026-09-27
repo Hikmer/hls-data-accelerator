@@ -826,7 +826,9 @@ def _persisted_workspace_id(ws_name: str) -> str:
         return match.group(0) if match else ""
 
     matching = []
-    for dep in deployments.values():
+    # Runs on executor threads while the event loop mutates `deployments`;
+    # list() copies the values atomically, so iteration cannot see a resize.
+    for dep in list(deployments.values()):
         cs = dep.get("customStatus") or {}
         if cs.get("workspaceName") == ws_name:
             matching.append(dep)
@@ -3229,7 +3231,7 @@ def _scan_resources_sync(subscription_id: str, progress_callback=None, status_ca
 
     # ── Collect previously deployed workspace names from DB ────────
     previously_deployed_ws_names: set[str] = set()
-    for dep in deployments.values():
+    for dep in list(deployments.values()):  # executor thread: iterate a snapshot
         cs = dep.get("customStatus", {})
         ws_name = cs.get("workspaceName", "")
         if ws_name and cs.get("runType") != "teardown":

@@ -185,7 +185,8 @@ $displayName = "cardiology-app-$ResourceGroupName"
 $redirect = "$appUrl/.auth/login/aad/callback"
 $named = @((Invoke-Az @("ad", "app", "list", "--filter", "displayName eq '$displayName'",
     "--query", "[].{appId:appId,uris:web.redirectUris}", "-o", "json")).Out | ConvertFrom-Json | ForEach-Object { $_ } | Where-Object { $_ })
-$bound = @($named | Where-Object { @($_.uris) -contains $redirect })
+# Redirect URI paths are case-sensitive in Entra: compare ordinally.
+$bound = @($named | Where-Object { @($_.uris) -ccontains $redirect })
 if ($bound.Count -gt 1) { throw "$($bound.Count) app registrations named $displayName are bound to $redirect; remove the extras." }
 if ($bound.Count -eq 1) {
     $appId = $bound[0].appId
@@ -249,9 +250,10 @@ Write-Host "  ✓ Sign-in limited to $($verified.Count) assigned account(s)" -Fo
 # using. Never printed; cleared at script end.
 function Test-ClientSecret([string]$Value, [datetime]$Until = (Get-Date).AddSeconds(30)) {
     if (-not $Value) { return $false }
-    while (($left = ($Until - (Get-Date)).TotalSeconds) -gt 0) {
+    # HttpClient's timeout covers the whole request; budgets never exceed the time left.
+    while (($left = ($Until - (Get-Date)).TotalSeconds) -ge 1) {
         try {
-            $token = Invoke-RestMethod -Method Post -Uri "https://login.microsoftonline.com/$ExpectedTenantId/oauth2/v2.0/token" -TimeoutSec ([Math]::Max(1, [Math]::Min(10, [int]$left))) -Body @{
+            $token = Invoke-RestMethod -Method Post -Uri "https://login.microsoftonline.com/$ExpectedTenantId/oauth2/v2.0/token" -TimeoutSec ([Math]::Min(10, [Math]::Floor($left))) -Body @{
                 client_id = $appId; client_secret = $Value; scope = "https://graph.microsoft.com/.default"; grant_type = "client_credentials" }
             if ($token.access_token) { return $true }
         } catch { }
@@ -321,6 +323,8 @@ function Test-AuthConfig {
     if ($registration.clientId -ne $appId) { return "auth uses client $($registration.clientId), expected $appId" }
     if ($excluded -ne "/api/health") { return "unexpected anonymous paths '$excluded'" }
     if ($secretNames -notcontains $registration.clientSecretSettingName) { return "client secret '$($registration.clientSecretSettingName)' is missing from the app" }
+    $registered = @((Invoke-Az @("ad", "app", "show", "--id", $appId, "--query", "web.redirectUris", "-o", "json")).Out | ConvertFrom-Json | ForEach-Object { $_ })
+    if ($registered -cnotcontains $redirect) { return "registration $appId does not list the callback $redirect" }
     if (-not (Test-ClientSecret (Get-InstalledSecret))) { return "the installed client secret does not authenticate as $appId" }
     return ""
 }
