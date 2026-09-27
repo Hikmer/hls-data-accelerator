@@ -382,16 +382,26 @@ def _az_json(az_run: Callable[..., Any], args: list[str], expected: type) -> Any
     return value
 
 
-def _client_secret_authenticates(tenant: str, client_id: str, secret: str) -> bool:
-    """Only a live secret for this app gets a client-credentials token."""
+def _client_secret_authenticates(tenant: str, client_id: str, secret: str, attempts: int = 6) -> bool:
+    """Only a live secret for this app gets a client-credentials token.
+
+    Entra replicates credential changes gradually and, for minutes after one,
+    refuses a valid secret intermittently (AADSTS7000215): one token proves the
+    secret; refusal counts only when every attempt is refused.
+    """
     body = urllib.parse.urlencode({"client_id": client_id, "client_secret": secret, "grant_type": "client_credentials",
                                    "scope": "https://graph.microsoft.com/.default"}).encode()
-    request = urllib.request.Request(f"https://login.microsoftonline.com/{tenant}/oauth2/v2.0/token", data=body)
-    try:
-        with urllib.request.urlopen(request, timeout=20) as response:
-            return response.status == 200 and "access_token" in json.load(response)
-    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError):
-        return False
+    for attempt in range(attempts):
+        request = urllib.request.Request(f"https://login.microsoftonline.com/{tenant}/oauth2/v2.0/token", data=body)
+        try:
+            with urllib.request.urlopen(request, timeout=20) as response:
+                if response.status == 200 and "access_token" in json.load(response):
+                    return True
+        except (urllib.error.URLError, TimeoutError, json.JSONDecodeError):
+            pass
+        if attempt + 1 < attempts:
+            time.sleep(5)
+    return False
 
 
 def _cardiology_auth_config_problem(config: dict[str, Any], app_name: str, az_run: Callable[..., Any]) -> str:

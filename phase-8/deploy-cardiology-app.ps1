@@ -230,17 +230,24 @@ if (($verified -join ",") -ne (@($allowed | Sort-Object) -join ",")) { throw "Ap
 Write-Host "  ✓ Sign-in limited to $($verified.Count) assigned account(s)" -ForegroundColor Green
 
 # The client secret Container Apps uses to redeem sign-in codes. A secret is
-# proven live by a client-credentials token request as this app. The installed
+# proven live by a client-credentials token request as this app. Entra
+# replicates credential changes gradually and, for minutes after one, refuses a
+# valid secret intermittently (AADSTS7000215), so one token proves a secret and
+# refusal counts only when it persists across the retry window. The installed
 # secret is reused while it authenticates; otherwise a credential is ADDED.
 # Credentials are never deleted here, so a failed or overlapping run cannot
 # revoke the secret the app is using. Never printed; cleared at script end.
 function Test-ClientSecret([string]$Value) {
     if (-not $Value) { return $false }
-    try {
-        $token = Invoke-RestMethod -Method Post -Uri "https://login.microsoftonline.com/$ExpectedTenantId/oauth2/v2.0/token" -TimeoutSec 20 -Body @{
-            client_id = $appId; client_secret = $Value; scope = "https://graph.microsoft.com/.default"; grant_type = "client_credentials" }
-        return [bool]$token.access_token
-    } catch { return $false }
+    for ($attempt = 1; $attempt -le 6; $attempt++) {
+        try {
+            $token = Invoke-RestMethod -Method Post -Uri "https://login.microsoftonline.com/$ExpectedTenantId/oauth2/v2.0/token" -TimeoutSec 20 -Body @{
+                client_id = $appId; client_secret = $Value; scope = "https://graph.microsoft.com/.default"; grant_type = "client_credentials" }
+            if ($token.access_token) { return $true }
+        } catch { }
+        if ($attempt -lt 6) { Start-Sleep -Seconds 5 }
+    }
+    return $false
 }
 function Get-InstalledSecret {
     $auth = Invoke-Az @("containerapp", "auth", "show", "-g", $ResourceGroupName, "-n", $appName, "-o", "json") -AllowFailure
