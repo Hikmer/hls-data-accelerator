@@ -158,7 +158,7 @@ if ($hasRegistryImage) {
         foreach ($revisionName in $activeRevisions) {
             Invoke-Az @("containerapp", "revision", "deactivate", "-g", $ResourceGroupName, "-n", $appName, "--revision", $revisionName, "-o", "none") | Out-Null
         }
-        Write-Host "  ! $appName was serving without sign-in; its revisions are offline until sign-in is enforced" -ForegroundColor Yellow
+        Write-Host "  ! $appName was not enforcing the intended sign-in policy; its revisions are offline until it is" -ForegroundColor Yellow
     }
 }
 # Offline = no active revision (quarantined now, or left offline by an earlier
