@@ -300,6 +300,8 @@ export function DeployWizard() {
   const [skipGroup2Collapsed, setSkipGroup2Collapsed] = useState(false);
   const [skipGroup3Collapsed, setSkipGroup3Collapsed] = useState(false);
   const [skipGroup4Collapsed, setSkipGroup4Collapsed] = useState(false);
+  const [skipGroup5Collapsed, setSkipGroup5Collapsed] = useState(false);
+  const [cardiologyUsersText, setCardiologyUsersText] = useState("");
 
   const [autoExportXlsx, setAutoExportXlsx] = useState(() => localStorage.getItem("autoExportXlsx") === "true");
   const [autoExportCsv, setAutoExportCsv] = useState(() => localStorage.getItem("autoExportCsv") === "true");
@@ -645,6 +647,10 @@ export function DeployWizard() {
     skip_graph_agent: false,
     payer_ops_email: "",
     claim_event_rate_per_minute: 60,
+    skip_cardiology_app: false,
+    phase8_only: false,
+    cardiology_app_path: "",
+    cardiology_app_users: [],
   });
 
   const [useNamingConvention, setUseNamingConvention] = useState(true);
@@ -713,6 +719,7 @@ export function DeployWizard() {
     if (!config.skip_activator) minutes += 1;
     if (!config.skip_quality_measures) minutes += 4;
     if (!config.skip_phase7) minutes += 46;
+    if (!config.skip_cardiology_app) minutes += 12;
     return Math.max(3, minutes);
   };
 
@@ -752,6 +759,7 @@ export function DeployWizard() {
         skip_graph_agent: false,
         payer_ops_email: prev.payer_ops_email || "",
         claim_event_rate_per_minute: prev.claim_event_rate_per_minute || 60,
+        skip_cardiology_app: false,
       };
       if (preset === "demo") {
         return { ...base, skip_imaging: true, skip_quality_measures: true, skip_payer_activator: !prev.alert_email && !prev.payer_ops_email };
@@ -775,6 +783,7 @@ export function DeployWizard() {
           skip_activator: true,
           skip_quality_measures: true,
           skip_payer_activator: true,
+          skip_cardiology_app: true,
         };
       }
       if (preset === "infra") {
@@ -801,13 +810,14 @@ export function DeployWizard() {
           skip_payer_activator: true,
           skip_ops_agent: true,
           skip_graph_agent: true,
+          skip_cardiology_app: true,
         };
       }
       if (preset === "repair") {
-        return { ...base, reuse_patients: true, reseed_data: false, skip_synthea: true, skip_device_assoc: true, skip_phase7: true, skip_payer_rti: true, skip_payer_activator: true, skip_ops_agent: true, skip_graph_agent: true };
+        return { ...base, reuse_patients: true, reseed_data: false, skip_synthea: true, skip_device_assoc: true, skip_phase7: true, skip_payer_rti: true, skip_payer_activator: true, skip_ops_agent: true, skip_graph_agent: true, skip_cardiology_app: true };
       }
       if (preset === "data") {
-        return { ...base, reuse_patients: false, reseed_data: false, skip_base_infra: true, skip_fhir: true, skip_dicom: true, skip_synthea: true, skip_device_assoc: true, skip_phase7: true, skip_payer_rti: true, skip_payer_activator: true, skip_ops_agent: true, skip_graph_agent: true };
+        return { ...base, reuse_patients: false, reseed_data: false, skip_base_infra: true, skip_fhir: true, skip_dicom: true, skip_synthea: true, skip_device_assoc: true, skip_phase7: true, skip_payer_rti: true, skip_payer_activator: true, skip_ops_agent: true, skip_graph_agent: true, skip_cardiology_app: true };
       }
       return { ...base, skip_activator: false, skip_payer_activator: false };
     });
@@ -831,6 +841,7 @@ export function DeployWizard() {
     [!config.skip_phase7 && !config.skip_payer_activator, "Payer Activator"],
     [!config.skip_phase7 && !config.skip_ops_agent, "Ops Agents"],
     [!config.skip_phase7 && !config.skip_graph_agent, "Graph Agent"],
+    [!config.skip_cardiology_app, "Cardiology App"],
   ].filter(([enabled]) => enabled).map(([, label]) => label as string);
 
   const uniqueSuffix = selectedSubscription && config.resource_group_name
@@ -863,6 +874,11 @@ export function DeployWizard() {
     { enabled: !config.skip_dicom, type: "ACI job", name: "dicom-loader-job" },
     { enabled: !config.skip_imaging, type: "Container App", name: "hds-dicom-proxy" },
     { enabled: !config.skip_imaging, type: "Static Web App", name: "OHIF DICOM viewer" },
+    { enabled: !config.skip_cardiology_app, type: "Container Apps environment", name: "cardioe2e-env" },
+    { enabled: !config.skip_cardiology_app, type: "Container App", name: "cardioe2e-app (Entra sign-in)" },
+    { enabled: !config.skip_cardiology_app, type: "User-assigned managed identity", name: "cardioe2e-identity" },
+    { enabled: !config.skip_cardiology_app, type: "Container Registry", name: "cardioe2e ACR (app image)" },
+    { enabled: !config.skip_cardiology_app, type: "AI Services", name: "cardioe2e-ai" },
   ].filter((asset) => asset.enabled);
 
   const prospectiveFabricAssets = [
@@ -920,6 +936,7 @@ export function DeployWizard() {
     { id: "payerkql", label: "Payer RTI KQL\nclaims + scores", group: "Fabric", x: 1190, y: 650, enabled: !config.skip_phase7 && !config.skip_payer_rti },
     { id: "payerops", label: "Payer Ops\nAgents + Activator", group: "Fabric", x: 1480, y: 650, enabled: !config.skip_phase7 && (!config.skip_ops_agent || !config.skip_payer_activator) },
     { id: "graphagent", label: "Healthcare Graph Agent", group: "Fabric", x: 1770, y: 650, enabled: !config.skip_phase7 && !config.skip_graph_agent },
+    { id: "cardioapp", label: "Cardiology App\nContainer Apps", group: "Azure", x: 610, y: 650, enabled: !config.skip_cardiology_app },
   ].filter((node) => node.enabled);
 
   const positionedGraphNodes = graphNodes.map((node) => {
@@ -2631,6 +2648,62 @@ export function DeployWizard() {
                             value={config.claim_event_rate_per_minute}
                             onChange={(_, d) => update("claim_event_rate_per_minute", Number(d.value ?? d.displayValue ?? 60))}
                             disabled={config.scaffolding_only || config.skip_phase7 || config.skip_payer_rti}
+                          />
+                        </Field>
+                      </div>
+                    </div>
+
+                    {/* ── Group 5: Cardiology app (Phase 8) ── */}
+                    <div
+                      onClick={() => setSkipGroup5Collapsed(!skipGroup5Collapsed)}
+                      style={{
+                        display: "flex",
+                        justifyContent: "space-between",
+                        alignItems: "center",
+                        padding: "8px 12px",
+                        backgroundColor: tokens.colorNeutralBackground3,
+                        borderRadius: tokens.borderRadiusMedium,
+                        cursor: "pointer",
+                        userSelect: "none",
+                        marginTop: tokens.spacingVerticalS,
+                        borderLeft: `4px solid ${tokens.colorPaletteBerryBorderActive}`
+                      }}
+                    >
+                      <Text weight="semibold" size={300} style={{ color: tokens.colorBrandForeground1 }}>
+                        5. Cardiology app (Phase 8)
+                      </Text>
+                      {skipGroup5Collapsed ? <ChevronDownRegular /> : <ChevronUpRegular />}
+                    </div>
+                    <div className={`deploy-collapsible-content ${skipGroup5Collapsed ? "deploy-collapsible-collapsed" : ""}`} style={{ display: "flex", flexDirection: "column", gap: tokens.spacingVerticalXS, padding: "8px 12px 12px", transition: "all 0.3s ease" }}>
+                      <Tooltip content="Build the cardiology app from a local checkout and deploy it: Container Apps + ACR + AI Services, Entra sign-in. Independent of Fabric." relationship="description" positioning="after">
+                        <Checkbox
+                          label="Cardiology app (Phase 8)"
+                          checked={!config.skip_cardiology_app}
+                          onChange={(_, d) => update("skip_cardiology_app", !d.checked)}
+                        />
+                      </Tooltip>
+                      <div style={{ paddingLeft: 24, display: "flex", flexDirection: "column", gap: tokens.spacingVerticalXS }}>
+                        <Field label="Cardiology app checkout path (optional)">
+                          <HistoryInput
+                            field="cardiology-app-path"
+                            value={config.cardiology_app_path ?? ""}
+                            onChange={(value) => update("cardiology_app_path", value)}
+                            placeholder="../caldova-cardio-e2e"
+                            disabled={config.skip_cardiology_app}
+                          />
+                        </Field>
+                        <Field label="Extra sign-in UPNs (optional, comma-separated)">
+                          <Input
+                            value={cardiologyUsersText || (config.cardiology_app_users ?? []).join(", ")}
+                            onChange={(_, d) => {
+                              setCardiologyUsersText(d.value);
+                              update(
+                                "cardiology_app_users",
+                                d.value.split(",").map((upn) => upn.trim()).filter(Boolean)
+                              );
+                            }}
+                            placeholder="user1@contoso.com, user2@contoso.com"
+                            disabled={config.skip_cardiology_app}
                           />
                         </Field>
                       </div>
