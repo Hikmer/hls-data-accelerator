@@ -178,16 +178,25 @@ $fqdn = (Invoke-Az @("containerapp", "show", "-g", $ResourceGroupName, "-n", $ap
 if (-not $fqdn) { throw "$appName has no ingress FQDN." }
 $appUrl = "https://$fqdn"
 
+# The registration is bound to this app by its sign-in callback (the Container
+# Apps FQDN is unique). Lookup is by exact name; only a registration already
+# bound to this callback is reused, and an unbound one is never taken over.
 $displayName = "cardiology-app-$ResourceGroupName"
 $redirect = "$appUrl/.auth/login/aad/callback"
-$appId = (Invoke-Az @("ad", "app", "list", "--display-name", $displayName, "--query", "[0].appId", "-o", "tsv")).Out.Trim()
-if (-not $appId) {
+$named = @((Invoke-Az @("ad", "app", "list", "--filter", "displayName eq '$displayName'",
+    "--query", "[].{appId:appId,uris:web.redirectUris}", "-o", "json")).Out | ConvertFrom-Json | ForEach-Object { $_ } | Where-Object { $_ })
+$bound = @($named | Where-Object { @($_.uris) -contains $redirect })
+if ($bound.Count -gt 1) { throw "$($bound.Count) app registrations named $displayName are bound to $redirect; remove the extras." }
+if ($bound.Count -eq 1) {
+    $appId = $bound[0].appId
+    Invoke-Az @("ad", "app", "update", "--id", $appId, "--enable-id-token-issuance", "true") | Out-Null
+    Write-Host "  = Reusing app registration $displayName" -ForegroundColor Gray
+} elseif ($named.Count -gt 0) {
+    throw "App registration $displayName exists but is not bound to $redirect; refusing to take it over."
+} else {
     $appId = (Invoke-Az @("ad", "app", "create", "--display-name", $displayName, "--sign-in-audience", "AzureADMyOrg",
         "--web-redirect-uris", $redirect, "--enable-id-token-issuance", "true", "--query", "appId", "-o", "tsv")).Out.Trim()
     Write-Host "  ✓ Created app registration $displayName" -ForegroundColor Green
-} else {
-    Invoke-Az @("ad", "app", "update", "--id", $appId, "--web-redirect-uris", $redirect, "--enable-id-token-issuance", "true") | Out-Null
-    Write-Host "  = Reusing app registration $displayName" -ForegroundColor Gray
 }
 $spId = (Invoke-Az @("ad", "sp", "show", "--id", $appId, "--query", "id", "-o", "tsv") -AllowFailure).Out.Trim()
 if (-not $spId) { $spId = (Invoke-Az @("ad", "sp", "create", "--id", $appId, "--query", "id", "-o", "tsv")).Out.Trim() }
@@ -233,19 +242,21 @@ Write-Host "  ✓ Sign-in limited to $($verified.Count) assigned account(s)" -Fo
 # proven live by a client-credentials token request as this app. Entra
 # replicates credential changes gradually and, for minutes after one, refuses a
 # valid secret intermittently (AADSTS7000215), so one token proves a secret and
-# refusal counts only when it persists across the retry window. The installed
-# secret is reused while it authenticates; otherwise a credential is ADDED.
-# Credentials are never deleted here, so a failed or overlapping run cannot
-# revoke the secret the app is using. Never printed; cleared at script end.
-function Test-ClientSecret([string]$Value) {
+# refusal counts only when it persists until -Until (probes 5 s apart, each
+# capped at 10 s and at the time left). The installed secret is reused while it
+# authenticates; otherwise a credential is ADDED. Credentials are never deleted
+# here, so a failed or overlapping run cannot revoke the secret the app is
+# using. Never printed; cleared at script end.
+function Test-ClientSecret([string]$Value, [datetime]$Until = (Get-Date).AddSeconds(30)) {
     if (-not $Value) { return $false }
-    for ($attempt = 1; $attempt -le 6; $attempt++) {
+    while (($left = ($Until - (Get-Date)).TotalSeconds) -gt 0) {
         try {
-            $token = Invoke-RestMethod -Method Post -Uri "https://login.microsoftonline.com/$ExpectedTenantId/oauth2/v2.0/token" -TimeoutSec 20 -Body @{
+            $token = Invoke-RestMethod -Method Post -Uri "https://login.microsoftonline.com/$ExpectedTenantId/oauth2/v2.0/token" -TimeoutSec ([Math]::Max(1, [Math]::Min(10, [int]$left))) -Body @{
                 client_id = $appId; client_secret = $Value; scope = "https://graph.microsoft.com/.default"; grant_type = "client_credentials" }
             if ($token.access_token) { return $true }
         } catch { }
-        if ($attempt -lt 6) { Start-Sleep -Seconds 5 }
+        $left = ($Until - (Get-Date)).TotalSeconds
+        if ($left -gt 0) { Start-Sleep -Milliseconds ([int](1000 * [Math]::Min(5, $left))) }
     }
     return $false
 }
@@ -264,10 +275,8 @@ if (Test-ClientSecret $secret) {
     $credentialName = "container-apps-auth-$(Get-Date -Format 'yyyyMMddHHmmss')"
     $secret = (Invoke-Az @("ad", "app", "credential", "reset", "--id", $appId, "--append", "--display-name", $credentialName,
         "--years", "1", "--query", "password", "-o", "tsv")).Out.Trim()
-    $deadline = (Get-Date).AddMinutes(3)
-    while (-not (Test-ClientSecret $secret)) {
-        if ((Get-Date) -gt $deadline) { throw "The new sign-in credential $credentialName was not accepted within 3 minutes." }
-        Start-Sleep -Seconds 10
+    if (-not (Test-ClientSecret $secret -Until (Get-Date).AddMinutes(3))) {
+        throw "The new sign-in credential $credentialName was not accepted within 3 minutes."
     }
     Write-Host "  ✓ Added sign-in credential $credentialName" -ForegroundColor Green
 }

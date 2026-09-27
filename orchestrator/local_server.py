@@ -1800,24 +1800,31 @@ def _apply_prior_success_skips(req: DeployRequest):
         _apply_success_skips_from_deployment(req, prior_deploy)
 
 
+def _apply_resume_skips(req: DeployRequest) -> None:
+    """Apply continue-from-failure or auto-resume skips (blocking live checks)."""
+    if req.phase7_only or req.phase8_only:
+        return
+    if req.continue_from_instance_id:
+        source_deploy = deployments.get(req.continue_from_instance_id)
+        if not source_deploy:
+            raise HTTPException(404, "Continuation source deployment not found")
+        if source_deploy.get("runtimeStatus") not in ["Failed", "Terminated"]:
+            raise HTTPException(409, "Continuation source deployment is not failed or terminated")
+        _apply_success_skips_from_deployment(req, source_deploy, "Continue-from-failure")
+        _apply_live_continuation_skips(req, source_deploy, "Continue-from-failure")
+    else:
+        _apply_prior_success_skips(req)
+
+
 @app.post("/api/deploy/start")
 async def start_deploy(req: DeployRequest):
     _apply_scaffolding_only(req)
     _apply_reseed_data(req)
     # Continue-from-failure uses the exact failed source run. Default starts keep
     # the older auto-resume behavior: skip safe successes from the latest failed
-    # deployment with the same workspace or resource group.
-    if not req.phase7_only and not req.phase8_only:
-        if req.continue_from_instance_id:
-            source_deploy = deployments.get(req.continue_from_instance_id)
-            if not source_deploy:
-                raise HTTPException(404, "Continuation source deployment not found")
-            if source_deploy.get("runtimeStatus") not in ["Failed", "Terminated"]:
-                raise HTTPException(409, "Continuation source deployment is not failed or terminated")
-            _apply_success_skips_from_deployment(req, source_deploy, "Continue-from-failure")
-            _apply_live_continuation_skips(req, source_deploy, "Continue-from-failure")
-        else:
-            _apply_prior_success_skips(req)
+    # deployment with the same workspace or resource group. The live checks this
+    # runs (Azure CLI, HTTP, sign-in probes) block, so keep them off the event loop.
+    await asyncio.get_event_loop().run_in_executor(None, _apply_resume_skips, req)
 
     # Auto-resume may update reuse/skip fields; explicit zero-data or reseed mode wins.
     _apply_scaffolding_only(req)

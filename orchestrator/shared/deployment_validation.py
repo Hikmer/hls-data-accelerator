@@ -382,25 +382,26 @@ def _az_json(az_run: Callable[..., Any], args: list[str], expected: type) -> Any
     return value
 
 
-def _client_secret_authenticates(tenant: str, client_id: str, secret: str, attempts: int = 6) -> bool:
+def _client_secret_authenticates(tenant: str, client_id: str, secret: str, window: float = 30.0) -> bool:
     """Only a live secret for this app gets a client-credentials token.
 
     Entra replicates credential changes gradually and, for minutes after one,
     refuses a valid secret intermittently (AADSTS7000215): one token proves the
-    secret; refusal counts only when every attempt is refused.
+    secret; refusal counts only when it persists for `window` seconds (probes
+    5 s apart, each capped at 10 s and at the time left).
     """
     body = urllib.parse.urlencode({"client_id": client_id, "client_secret": secret, "grant_type": "client_credentials",
                                    "scope": "https://graph.microsoft.com/.default"}).encode()
-    for attempt in range(attempts):
+    deadline = time.monotonic() + window
+    while (left := deadline - time.monotonic()) > 0:
         request = urllib.request.Request(f"https://login.microsoftonline.com/{tenant}/oauth2/v2.0/token", data=body)
         try:
-            with urllib.request.urlopen(request, timeout=20) as response:
+            with urllib.request.urlopen(request, timeout=min(10.0, left)) as response:
                 if response.status == 200 and "access_token" in json.load(response):
                     return True
         except (urllib.error.URLError, TimeoutError, json.JSONDecodeError):
             pass
-        if attempt + 1 < attempts:
-            time.sleep(5)
+        time.sleep(max(0.0, min(5.0, deadline - time.monotonic())))
     return False
 
 
