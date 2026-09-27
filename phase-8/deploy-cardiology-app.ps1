@@ -254,90 +254,93 @@ Write-Host "  ✓ Sign-in limited to $($verified.Count) assigned account(s)" -Fo
 # cannot revoke the secret the app is using. Never printed; cleared at script end.
 $tokenClient = [System.Net.Http.HttpClient]::new()
 $tokenClient.Timeout = [System.Threading.Timeout]::InfiniteTimeSpan  # each attempt carries its own deadline
-function Test-ClientSecret([string]$Value, [datetime]$Until = (Get-Date).AddSeconds(30)) {
-    if (-not $Value) { return $false }
-    $form = "client_id=$appId&scope=$([uri]::EscapeDataString('https://graph.microsoft.com/.default'))&grant_type=client_credentials&client_secret=$([uri]::EscapeDataString($Value))"
-    while (($left = ($Until - (Get-Date)).TotalMilliseconds) -gt 0) {
-        $cancel = [System.Threading.CancellationTokenSource]::new([TimeSpan]::FromMilliseconds([Math]::Min(10000, $left)))
-        $response = $null; $content = $null
-        try {
-            $content = [System.Net.Http.StringContent]::new($form, [System.Text.Encoding]::UTF8, "application/x-www-form-urlencoded")
-            $response = $tokenClient.PostAsync("https://login.microsoftonline.com/$ExpectedTenantId/oauth2/v2.0/token", $content, $cancel.Token).GetAwaiter().GetResult()
-            if ($response.IsSuccessStatusCode -and ($response.Content.ReadAsStringAsync().GetAwaiter().GetResult() | ConvertFrom-Json).access_token) { return $true }
-        } catch { } finally { if ($response) { $response.Dispose() }; if ($content) { $content.Dispose() }; $cancel.Dispose() }
-        $left = ($Until - (Get-Date)).TotalMilliseconds
-        if ($left -gt 0) { Start-Sleep -Milliseconds ([int][Math]::Min(5000, $left)) }
-    }
-    return $false
-}
-function Get-InstalledSecret {
-    $auth = Invoke-Az @("containerapp", "auth", "show", "-g", $ResourceGroupName, "-n", $appName, "-o", "json") -AllowFailure
-    try { $settingName = ($auth.Out | ConvertFrom-Json).identityProviders.azureActiveDirectory.registration.clientSecretSettingName } catch { $settingName = "" }
-    if ($auth.Code -ne 0 -or -not $settingName) { return "" }
-    $installed = Invoke-Az @("containerapp", "secret", "show", "-g", $ResourceGroupName, "-n", $appName,
-        "--secret-name", $settingName, "--query", "value", "-o", "tsv") -AllowFailure
-    if ($installed.Code -eq 0) { return $installed.Out.Trim() } else { return "" }
-}
-$secret = Get-InstalledSecret
-if (Test-ClientSecret $secret) {
-    Write-Host "  = Reusing the installed sign-in secret; it authenticates as the app" -ForegroundColor DarkGray
-} else {
-    $credentialName = "container-apps-auth-$(Get-Date -Format 'yyyyMMddHHmmss')"
-    $secret = (Invoke-Az @("ad", "app", "credential", "reset", "--id", $appId, "--append", "--display-name", $credentialName,
-        "--years", "1", "--query", "password", "-o", "tsv")).Out.Trim()
-    if (-not (Test-ClientSecret $secret -Until (Get-Date).AddMinutes(3))) {
-        throw "The new sign-in credential $credentialName was not accepted within 3 minutes."
-    }
-    Write-Host "  ✓ Added sign-in credential $credentialName" -ForegroundColor Green
-}
-Invoke-Az @("containerapp", "auth", "microsoft", "update", "-g", $ResourceGroupName, "-n", $appName,
-    # "=" form: generated secrets can start with "-", which argparse reads as a flag.
-    "--client-id", $appId, "--client-secret=$secret",
-    # The v2 issuer names the tenant; the CLI rejects --tenant-id alongside it.
-    "--issuer", "https://login.microsoftonline.com/$ExpectedTenantId/v2.0", "--yes", "-o", "none") | Out-Null
-Invoke-Az @("containerapp", "auth", "update", "-g", $ResourceGroupName, "-n", $appName, "--enabled", "true",
-    "--unauthenticated-client-action", "RedirectToLoginPage", "--redirect-provider", "azureactivedirectory",
-    "--excluded-paths", "/api/health", "-o", "none") | Out-Null
-
-# Easy Auth redirects only browser requests (others get 401), so probe as one,
-# without following the redirect, and require it to land on this tenant's sign-in.
-$handler = [System.Net.Http.HttpClientHandler]::new()
-$handler.AllowAutoRedirect = $false
-$browser = [System.Net.Http.HttpClient]::new($handler)
-$browser.Timeout = [TimeSpan]::FromSeconds(15)
-$browser.DefaultRequestHeaders.UserAgent.ParseAdd("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0 Safari/537.36")
-$browser.DefaultRequestHeaders.Accept.ParseAdd("text/html,application/xhtml+xml")
-$signIn = "https://login.microsoftonline.com/$ExpectedTenantId/"
-function Test-SignInEnforced {
-    try {
-        $response = $browser.GetAsync("$appUrl/").GetAwaiter().GetResult()
-        try {
-            $location = if ($response.Headers.Location) { $response.Headers.Location.AbsoluteUri } else { "" }
-            if ([int]$response.StatusCode -eq 302 -and $location.StartsWith($signIn) -and $location.Contains("client_id=$appId")) { return "" }
-            return "unauthenticated browser request to / returned $([int]$response.StatusCode) (Location '$location')"
-        } finally { $response.Dispose() }
-    } catch { return "sign-in probe: $($_.Exception.Message)" }
-}
-
-# Control plane: auth is enforcing for this registration, only /api/health is
-# anonymous, and the installed client secret authenticates as the app (without
-# it the redirect works but every sign-in callback fails).
-function Test-AuthConfig {
-    $cfg = (Invoke-Az @("containerapp", "auth", "show", "-g", $ResourceGroupName, "-n", $appName, "-o", "json")).Out | ConvertFrom-Json
-    $registration = $cfg.identityProviders.azureActiveDirectory.registration
-    $excluded = @($cfg.globalValidation.excludedPaths) -join ","
-    $secretNames = @((Invoke-Az @("containerapp", "secret", "list", "-g", $ResourceGroupName, "-n", $appName, "--query", "[].name", "-o", "tsv")).Out -split "`n")
-    if (-not ($cfg.platform.enabled -eq $true -and $cfg.globalValidation.unauthenticatedClientAction -eq "RedirectToLoginPage")) { return "auth is not redirecting unauthenticated visitors" }
-    if ($registration.clientId -ne $appId) { return "auth uses client $($registration.clientId), expected $appId" }
-    if ($excluded -ne "/api/health") { return "unexpected anonymous paths '$excluded'" }
-    if ($secretNames -notcontains $registration.clientSecretSettingName) { return "client secret '$($registration.clientSecretSettingName)' is missing from the app" }
-    $registered = @((Invoke-Az @("ad", "app", "show", "--id", $appId, "--query", "web.redirectUris", "-o", "json")).Out | ConvertFrom-Json | ForEach-Object { $_ })
-    if ($registered.Count -ne 1 -or $registered -cnotcontains $redirect) { return "registration $appId redirect URIs are not exactly the callback $redirect" }
-    if (-not (Test-ClientSecret (Get-InstalledSecret))) { return "the installed client secret does not authenticate as $appId" }
-    return ""
-}
-
+# Everything that holds the secret or the HTTP clients runs inside this try, so
+# every exit (including a rejected credential or a failed auth update) cleans up.
+$browser = $null
 try {
+    function Test-ClientSecret([string]$Value, [datetime]$Until = (Get-Date).AddSeconds(30)) {
+        if (-not $Value) { return $false }
+        $form = "client_id=$appId&scope=$([uri]::EscapeDataString('https://graph.microsoft.com/.default'))&grant_type=client_credentials&client_secret=$([uri]::EscapeDataString($Value))"
+        while (($left = ($Until - (Get-Date)).TotalMilliseconds) -gt 0) {
+            $cancel = [System.Threading.CancellationTokenSource]::new([TimeSpan]::FromMilliseconds([Math]::Min(10000, $left)))
+            $response = $null; $content = $null
+            try {
+                $content = [System.Net.Http.StringContent]::new($form, [System.Text.Encoding]::UTF8, "application/x-www-form-urlencoded")
+                $response = $tokenClient.PostAsync("https://login.microsoftonline.com/$ExpectedTenantId/oauth2/v2.0/token", $content, $cancel.Token).GetAwaiter().GetResult()
+                if ($response.IsSuccessStatusCode -and ($response.Content.ReadAsStringAsync().GetAwaiter().GetResult() | ConvertFrom-Json).access_token) { return $true }
+            } catch { } finally { if ($response) { $response.Dispose() }; if ($content) { $content.Dispose() }; $cancel.Dispose() }
+            $left = ($Until - (Get-Date)).TotalMilliseconds
+            if ($left -gt 0) { Start-Sleep -Milliseconds ([int][Math]::Min(5000, $left)) }
+        }
+        return $false
+    }
+    function Get-InstalledSecret {
+        $auth = Invoke-Az @("containerapp", "auth", "show", "-g", $ResourceGroupName, "-n", $appName, "-o", "json") -AllowFailure
+        try { $settingName = ($auth.Out | ConvertFrom-Json).identityProviders.azureActiveDirectory.registration.clientSecretSettingName } catch { $settingName = "" }
+        if ($auth.Code -ne 0 -or -not $settingName) { return "" }
+        $installed = Invoke-Az @("containerapp", "secret", "show", "-g", $ResourceGroupName, "-n", $appName,
+            "--secret-name", $settingName, "--query", "value", "-o", "tsv") -AllowFailure
+        if ($installed.Code -eq 0) { return $installed.Out.Trim() } else { return "" }
+    }
+    $secret = Get-InstalledSecret
+    if (Test-ClientSecret $secret) {
+        Write-Host "  = Reusing the installed sign-in secret; it authenticates as the app" -ForegroundColor DarkGray
+    } else {
+        $credentialName = "container-apps-auth-$(Get-Date -Format 'yyyyMMddHHmmss')"
+        $secret = (Invoke-Az @("ad", "app", "credential", "reset", "--id", $appId, "--append", "--display-name", $credentialName,
+            "--years", "1", "--query", "password", "-o", "tsv")).Out.Trim()
+        if (-not (Test-ClientSecret $secret -Until (Get-Date).AddMinutes(3))) {
+            throw "The new sign-in credential $credentialName was not accepted within 3 minutes."
+        }
+        Write-Host "  ✓ Added sign-in credential $credentialName" -ForegroundColor Green
+    }
+    Invoke-Az @("containerapp", "auth", "microsoft", "update", "-g", $ResourceGroupName, "-n", $appName,
+        # "=" form: generated secrets can start with "-", which argparse reads as a flag.
+        "--client-id", $appId, "--client-secret=$secret",
+        # The v2 issuer names the tenant; the CLI rejects --tenant-id alongside it.
+        "--issuer", "https://login.microsoftonline.com/$ExpectedTenantId/v2.0", "--yes", "-o", "none") | Out-Null
+    Invoke-Az @("containerapp", "auth", "update", "-g", $ResourceGroupName, "-n", $appName, "--enabled", "true",
+        "--unauthenticated-client-action", "RedirectToLoginPage", "--redirect-provider", "azureactivedirectory",
+        "--excluded-paths", "/api/health", "-o", "none") | Out-Null
+
+    # Easy Auth redirects only browser requests (others get 401), so probe as one,
+    # without following the redirect, and require it to land on this tenant's sign-in.
+    $handler = [System.Net.Http.HttpClientHandler]::new()
+    $handler.AllowAutoRedirect = $false
+    $browser = [System.Net.Http.HttpClient]::new($handler)
+    $browser.Timeout = [TimeSpan]::FromSeconds(15)
+    $browser.DefaultRequestHeaders.UserAgent.ParseAdd("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0 Safari/537.36")
+    $browser.DefaultRequestHeaders.Accept.ParseAdd("text/html,application/xhtml+xml")
+    $signIn = "https://login.microsoftonline.com/$ExpectedTenantId/"
+    function Test-SignInEnforced {
+        try {
+            $response = $browser.GetAsync("$appUrl/").GetAwaiter().GetResult()
+            try {
+                $location = if ($response.Headers.Location) { $response.Headers.Location.AbsoluteUri } else { "" }
+                if ([int]$response.StatusCode -eq 302 -and $location.StartsWith($signIn) -and $location.Contains("client_id=$appId")) { return "" }
+                return "unauthenticated browser request to / returned $([int]$response.StatusCode) (Location '$location')"
+            } finally { $response.Dispose() }
+        } catch { return "sign-in probe: $($_.Exception.Message)" }
+    }
+
+    # Control plane: auth is enforcing for this registration, only /api/health is
+    # anonymous, and the installed client secret authenticates as the app (without
+    # it the redirect works but every sign-in callback fails).
+    function Test-AuthConfig {
+        $cfg = (Invoke-Az @("containerapp", "auth", "show", "-g", $ResourceGroupName, "-n", $appName, "-o", "json")).Out | ConvertFrom-Json
+        $registration = $cfg.identityProviders.azureActiveDirectory.registration
+        $excluded = @($cfg.globalValidation.excludedPaths) -join ","
+        $secretNames = @((Invoke-Az @("containerapp", "secret", "list", "-g", $ResourceGroupName, "-n", $appName, "--query", "[].name", "-o", "tsv")).Out -split "`n")
+        if (-not ($cfg.platform.enabled -eq $true -and $cfg.globalValidation.unauthenticatedClientAction -eq "RedirectToLoginPage")) { return "auth is not redirecting unauthenticated visitors" }
+        if ($registration.clientId -ne $appId) { return "auth uses client $($registration.clientId), expected $appId" }
+        if ($excluded -ne "/api/health") { return "unexpected anonymous paths '$excluded'" }
+        if ($secretNames -notcontains $registration.clientSecretSettingName) { return "client secret '$($registration.clientSecretSettingName)' is missing from the app" }
+        $registered = @((Invoke-Az @("ad", "app", "show", "--id", $appId, "--query", "web.redirectUris", "-o", "json")).Out | ConvertFrom-Json | ForEach-Object { $_ })
+        if ($registered.Count -ne 1 -or $registered -cnotcontains $redirect) { return "registration $appId redirect URIs are not exactly the callback $redirect" }
+        if (-not (Test-ClientSecret (Get-InstalledSecret))) { return "the installed client secret does not authenticate as $appId" }
+        return ""
+    }
+
     $problem = Test-AuthConfig
     if ($problem) { throw "Container Apps sign-in is not correctly configured ($problem); the app image was not published." }
     # Then the live edge, unless offline (no active revision answers).
@@ -401,7 +404,7 @@ if ($builtTags.Code -eq 0 -and ($builtTags.Out -split "`n") -contains $tag) {
     if (-not $healthOk -or $problem) { throw "Cardiology app did not become ready at $appUrl within 5 minutes: $problem" }
     $problem = Test-AuthConfig
     if ($problem) { throw "Sign-in configuration broke during the revision deploy: $problem" }
-} finally { $browser.Dispose(); $tokenClient.Dispose(); $secret = $null }
+} finally { if ($browser) { $browser.Dispose() }; $tokenClient.Dispose(); $secret = $null }
 
 Write-Host "  ✓ $appUrl healthy on revision $tag; unauthenticated visitors are sent to sign-in" -ForegroundColor Green
 Write-Host ""

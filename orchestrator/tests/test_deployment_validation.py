@@ -377,7 +377,9 @@ class DeploymentValidationTests(unittest.TestCase):
 
     def test_cardiology_sign_in_requires_edge_protection_and_exact_access_policy(self) -> None:
         tenant = "8d038e6a-9b7d-4cb8-bbcf-e84dff156478"
-        sign_in = f"https://login.microsoftonline.com/{tenant}/oauth2/v2.0/authorize?client_id=x"
+        authorize = f"https://login.microsoftonline.com/{tenant}/oauth2/v2.0/authorize"
+        callback = "https%3A%2F%2Fcardio.example.test%2F.auth%2Flogin%2Faad%2Fcallback"
+        sign_in = f"{authorize}?response_type=code+id_token&redirect_uri={callback}&client_id=app&scope=openid"
         protected = {"/": (302, sign_in), "/api/activity": (401, "")}
         good = {
             "auth": {"platform": {"enabled": True},
@@ -402,6 +404,8 @@ class DeploymentValidationTests(unittest.TestCase):
             ("auth off at the edge", {"/": (200, ""), "/api/activity": (200, "")}, good, {}, "fail"),
             ("another tenant's sign-in", {"/": (302, "https://login.microsoftonline.com/other/oauth2"), "/api/activity": (401, "")}, good, {}, "fail"),
             ("API excluded from auth", {"/": (302, sign_in), "/api/activity": (200, "")}, good, {}, "fail"),
+            ("redirect names another client", {"/": (302, f"{authorize}?redirect_uri={callback}&client_id=stale"), "/api/activity": (401, "")}, good, {}, "fail"),
+            ("redirect has no callback", {"/": (302, f"{authorize}?client_id=app"), "/api/activity": (401, "")}, good, {}, "fail"),
             ("callback secret missing", protected, variant(secrets=[]), {}, "fail"),
             ("installed secret revoked", protected, variant(secret_value="revoked"), {}, "fail"),
             ("empty auth output", protected, variant(auth=None), {}, "fail"),

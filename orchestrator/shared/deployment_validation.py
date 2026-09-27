@@ -417,12 +417,14 @@ def _client_secret_authenticates(tenant: str, client_id: str, secret: str, windo
     return False
 
 
-def _cardiology_auth_config_problem(config: dict[str, Any], app_name: str, fqdn: str, az_run: Callable[..., Any]) -> str:
+def _cardiology_auth_config_problem(config: dict[str, Any], app_name: str, fqdn: str, sign_in_location: str,
+                                    az_run: Callable[..., Any]) -> str:
     """The control-plane access policy the deployment script establishes.
 
     Redirect every unauthenticated request except /api/health, hold a client
     secret that authenticates as the app (the callback redeems codes with it),
-    register exactly this app's callback (case-sensitive, nothing else), require
+    register exactly this app's callback (case-sensitive, nothing else), send
+    anonymous browsers to sign-in for that registration and callback, require
     app assignment, and assign exactly the deploying user plus cardiology_app_users.
     """
     scope = ["-g", str(config.get("resource_group_name") or ""), "-n", app_name]
@@ -448,6 +450,9 @@ def _cardiology_auth_config_problem(config: dict[str, Any], app_name: str, fqdn:
         callback = f"https://{fqdn}/.auth/login/aad/callback"
         if _az_json(az_run, ["az", "ad", "app", "show", "--id", client_id, "--query", "web.redirectUris"], list) != [callback]:
             return f"registration redirect URIs are not exactly the callback {callback}"
+        query = urllib.parse.parse_qs(urllib.parse.urlparse(sign_in_location).query)
+        if query.get("client_id") != [client_id] or query.get("redirect_uri") != [callback]:
+            return "the sign-in redirect does not name this app's registration and callback"
         sp = _az_json(az_run, ["az", "ad", "sp", "show", "--id", client_id], dict)
         if sp.get("appRoleAssignmentRequired") is not True:
             return "app assignment is not required"
@@ -480,7 +485,7 @@ def cardiology_sign_in_check(config: dict[str, Any], az_run: Callable[..., Any])
     except Exception as exc:
         return _check(CARDIOLOGY_SIGN_IN_CHECK_NAME, False, f"{type(exc).__name__}: {exc}")
     redirected = page_status == 302 and location.startswith(f"https://login.microsoftonline.com/{tenant}/")
-    policy_problem = _cardiology_auth_config_problem(config, app_name, fqdn, az_run)
+    policy_problem = _cardiology_auth_config_problem(config, app_name, fqdn, location, az_run)
     return _check(CARDIOLOGY_SIGN_IN_CHECK_NAME, redirected and api_status == 401 and not policy_problem,
                   f"browser / -> {page_status} {location[:80]}; anonymous /api/activity -> {api_status}"
                   + (f"; {policy_problem}" if policy_problem else ""))
