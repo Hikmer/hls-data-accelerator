@@ -459,7 +459,9 @@ try {
             try {
                 $location = if ($response.Headers.Location) { $response.Headers.Location.AbsoluteUri } else { "" }
                 # The redirect must name exactly this registration and this app's callback.
-                $query = if ($location) { [System.Web.HttpUtility]::ParseQueryString(([uri]$location).Query) } else { $null }
+                # Assigned directly: an `if` expression would unroll the collection into strings.
+                $query = $null
+                if ($location) { $query = [System.Web.HttpUtility]::ParseQueryString(([uri]$location).Query) }
                 if ([int]$response.StatusCode -eq 302 -and $location.StartsWith($signIn) -and
                     ((@($query.GetValues("client_id")) -join ",") -ceq $appId) -and ((@($query.GetValues("redirect_uri")) -join ",") -ceq $redirect)) { return "" }
                 return "unauthenticated browser request to / returned $([int]$response.StatusCode) (Location '$location')"
