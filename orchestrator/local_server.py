@@ -265,7 +265,15 @@ from shared.database import (
     get_form_history, add_form_history,
     get_dismissed_teardowns, dismiss_teardown,
 )
-from shared.deployment_validation import effective_validation_config, feature_presence_checks, runtime_feature_checks
+from shared.deployment_validation import (
+    CARDIOLOGY_WORKLOAD_TAG,
+    CARDIOLOGY_WORKLOAD_VALUE,
+    cardiology_app_check,
+    cardiology_app_resources,
+    effective_validation_config,
+    feature_presence_checks,
+    runtime_feature_checks,
+)
 
 # Migrate from old JSON state file if it exists
 migrate_from_json(STATE_FILE)
@@ -607,8 +615,12 @@ def _get_auth_context_sync() -> dict:
     if cli["loggedIn"] and pwsh["loggedIn"] and (not sub_aligned or not tenant_aligned):
         issues.append("Azure CLI and Az PowerShell are using different subscription/tenant contexts.")
 
+    cli_issues = [i for i in issues if i.startswith("Azure CLI is")]
     return {
         "ready": len(issues) == 0,
+        # Phase 8 runs only Azure CLI commands, so it needs only this half.
+        "cliReady": len(cli_issues) == 0,
+        "cliIssues": cli_issues,
         "cli": cli,
         "pwsh": pwsh,
         "aligned": {
@@ -634,6 +646,11 @@ class Phase7ContinuationRequest(BaseModel):
     alert_email: str = ""
     payer_ops_email: str = ""
     claim_event_rate_per_minute: int = 60
+
+
+class Phase8ContinuationRequest(BaseModel):
+    cardiology_app_path: str = ""
+    cardiology_app_users: list[str] = []
 
 
 import re as _re
@@ -699,11 +716,15 @@ class DeployRequest(BaseModel):
     skip_graph_agent: bool = False
     payer_ops_email: str = ""
     claim_event_rate_per_minute: int = 60
+    skip_cardiology_app: bool = False
+    cardiology_app_path: str = ""
+    cardiology_app_users: list[str] = []
     dicom_toolkit_path: str = ""
     phase7_only: bool = False
     phase2_only: bool = False
     phase3_only: bool = False
     phase4_only: bool = False
+    phase8_only: bool = False
     continue_from_instance_id: str = ""
 
     @model_validator(mode="after")
@@ -1458,6 +1479,7 @@ def _live_resume_prerequisites(req: DeployRequest, cloud_state: dict) -> dict:
         "cloud": cloud_state,
         "azureTypes": set(),
         "azureNames": set(),
+        "azureResources": [],
         "fabricItems": [],
         "fhirCounts": {"patients": 0, "devices": 0, "exportedFiles": 0, "dicomStudies": 0},
     }
@@ -1466,6 +1488,7 @@ def _live_resume_prerequisites(req: DeployRequest, cloud_state: dict) -> dict:
         evidence["azureTypes"] = {str(r.get("fullType") or r.get("type") or "").lower() for r in resources.get("azure") or []}
         evidence["azureNames"] = {str(r.get("name") or "").lower() for r in resources.get("azure") or []}
         evidence["fabricItems"] = resources.get("fabric") or []
+        evidence["azureResources"] = resources.get("azure") or []
     except Exception as ex:
         logger.warning("Resume prerequisite resource query failed: %s", ex)
     if req.resource_group_name and bool((cloud_state.get("resourceGroup") or {}).get("exists")):
@@ -1547,6 +1570,17 @@ def _phase_live_prerequisites_ok(req: DeployRequest, phase_name: str, evidence: 
         if not has_dashboard:
             missing.append("Masimo dashboard")
         return (False, f"Fabric RTI incomplete: missing {', '.join(missing)}")
+
+    if "CARDIOLOGY APP" in phase_name:
+        if not rg_exists:
+            return (False, "Resource group not verified")
+        apps = cardiology_app_resources(evidence.get("azureResources") or [])
+        if not apps:
+            return (False, f"No Container App tagged {CARDIOLOGY_WORKLOAD_TAG}={CARDIOLOGY_WORKLOAD_VALUE} in {req.resource_group_name}")
+        health = cardiology_app_check(req.model_dump(), _az_run)
+        if health["status"] != "pass":
+            return (False, f"Cardiology app health check failed: {health['detail']}")
+        return (True, f"Cardiology app verified: {health['detail']}")
 
     return (True, "No extra live prerequisite check required")
 
@@ -1653,12 +1687,14 @@ def _apply_success_skips_from_deployment(req: DeployRequest, prior_deploy: dict,
             req.skip_activator = True
         elif "CMS QUALITY" in phase_name:
             req.skip_quality_measures = True
+        elif "CARDIOLOGY APP" in phase_name:
+            req.skip_cardiology_app = True
         else:
             continue
         applied = True
 
-    logger.info("%s activated: loaded successful phases from %s. Applied skips: base_infra=%s, fhir=%s, dicom=%s, fabric=%s, reuse_rti=%s, rti2=%s, hds=%s, agents=%s, imaging=%s, ontology=%s, activator=%s, quality=%s",
-                mode, prior_deploy["instanceId"], req.skip_base_infra, req.skip_fhir, req.skip_dicom, req.skip_fabric, req.reuse_fabric_rti, req.skip_rti_phase2, req.skip_hds_pipelines, req.skip_data_agents, req.skip_imaging, req.skip_ontology, req.skip_activator, req.skip_quality_measures)
+    logger.info("%s activated: loaded successful phases from %s. Applied skips: base_infra=%s, fhir=%s, dicom=%s, fabric=%s, reuse_rti=%s, rti2=%s, hds=%s, agents=%s, imaging=%s, ontology=%s, activator=%s, quality=%s, cardiology_app=%s",
+                mode, prior_deploy["instanceId"], req.skip_base_infra, req.skip_fhir, req.skip_dicom, req.skip_fabric, req.reuse_fabric_rti, req.skip_rti_phase2, req.skip_hds_pipelines, req.skip_data_agents, req.skip_imaging, req.skip_ontology, req.skip_activator, req.skip_quality_measures, req.skip_cardiology_app)
     return applied
 
 
@@ -1756,7 +1792,7 @@ async def start_deploy(req: DeployRequest):
     # Continue-from-failure uses the exact failed source run. Default starts keep
     # the older auto-resume behavior: skip safe successes from the latest failed
     # deployment with the same workspace or resource group.
-    if not req.phase7_only:
+    if not req.phase7_only and not req.phase8_only:
         if req.continue_from_instance_id:
             source_deploy = deployments.get(req.continue_from_instance_id)
             if not source_deploy:
@@ -1781,10 +1817,12 @@ async def start_deploy(req: DeployRequest):
     req.require_bronze_clinical_fhir = selected_synth_clinical or req.require_bronze_clinical_fhir
     req.require_bronze_imaging_dicom = selected_synth_imaging or req.require_bronze_imaging_dicom
 
-    # Hard gate on local auth/tooling readiness before launch.
+    # Hard gate on local auth/tooling readiness before launch. A Phase 8-only run
+    # uses the Azure CLI exclusively and does not need Az PowerShell.
     auth_context = await asyncio.get_event_loop().run_in_executor(None, _get_auth_context_sync)
-    if not auth_context.get("ready", False):
-        issues = auth_context.get("issues", [])
+    auth_ready_key, auth_issues_key = ("cliReady", "cliIssues") if req.phase8_only else ("ready", "issues")
+    if not auth_context.get(auth_ready_key, False):
+        issues = auth_context.get(auth_issues_key, [])
         return func_response(
             {
                 "error": "Deployment blocked: local Azure auth context is not ready.",
@@ -1798,13 +1836,16 @@ async def start_deploy(req: DeployRequest):
     # Milestone numbers encode which progress-bar milestones are active:
     #   1 = Data Fabric Foundation, 2 = Active Patient Telemetry,
     #   3 = Multimodal Cohorting & Imaging, 4 = Connected Semantic Intelligence,
-    #   5 = Bedside Alerting & Action, 6 = CMS Quality & Performance, 7 = Payer RTI & Ops
+    #   5 = Bedside Alerting & Action, 6 = CMS Quality & Performance,
+    #   7 = Payer RTI & Ops, 8 = Cardiology App
     now_local = datetime.now()
     timestamp = now_local.strftime("%Y%m%d-%H%M%S")
 
     # Determine active milestones from config flags
     if req.phase7_only:
         milestones = [7]
+    elif req.phase8_only:
+        milestones = [8]
     else:
         milestones = [1]  # Milestone 1: Data Fabric Foundation (always active)
         if not req.skip_fabric:
@@ -1819,6 +1860,17 @@ async def start_deploy(req: DeployRequest):
             milestones.append(6)  # Milestone 6: Population Health & Quality
         if not req.skip_phase7:
             milestones.append(7)  # Milestone 7: Payer RTI & Ops
+        if not req.skip_cardiology_app:
+            milestones.append(8)  # Milestone 8: Cardiology App
+
+    # A full plan streams 16 components, plus Phase 8 when the cardiology app is
+    # selected. -Phase8 runs exactly one step on its own.
+    if req.phase8_only:
+        total_phases = 1
+    elif req.phase7_only or req.phase2_only or req.phase3_only or req.phase4_only:
+        total_phases = 16
+    else:
+        total_phases = 16 if req.skip_cardiology_app else 17
 
     phase_label = "P" + "".join(str(m) for m in milestones)
 
@@ -1834,7 +1886,7 @@ async def start_deploy(req: DeployRequest):
             "status": "running",
             "detail": "",
             "completedPhases": 0,
-            "totalPhases": 16,
+            "totalPhases": total_phases,
             "resources": {},
             "logs": [],
             "subStepsByPhase": {},
@@ -1890,6 +1942,31 @@ async def continue_phase7(instance_id: str, req: Phase7ContinuationRequest | Non
             prior_config["payer_ops_email"] = req.payer_ops_email
         prior_config["claim_event_rate_per_minute"] = req.claim_event_rate_per_minute
     return await start_deploy(DeployRequest(**prior_config))
+
+
+@app.post("/api/deploy/{instance_id}/continue-phase8")
+async def continue_phase8(instance_id: str, req: Phase8ContinuationRequest | None = None):
+    dep = deployments.get(instance_id)
+    if not dep:
+        raise HTTPException(404, "Instance not found")
+    prior_config = ((dep.get("customStatus") or {}).get("deployConfig") or {}).copy()
+    if not prior_config:
+        raise HTTPException(422, "No deployment configuration is stored for this run")
+    prior_config.update({
+        "phase8_only": True,
+        "skip_cardiology_app": False,
+        "phase2_only": False,
+        "phase3_only": False,
+        "phase4_only": False,
+        "phase7_only": False,
+    })
+    if req:
+        if req.cardiology_app_path:
+            prior_config["cardiology_app_path"] = req.cardiology_app_path
+        if req.cardiology_app_users:
+            prior_config["cardiology_app_users"] = req.cardiology_app_users
+    return await start_deploy(DeployRequest(**prior_config))
+
 
 @app.post("/api/deploy/{instance_id}/continue-failed")
 async def continue_failed_deployment(instance_id: str):
@@ -2846,7 +2923,7 @@ def _get_deployed_resources_sync(ws_name: str, rg_name: str) -> dict:
                 # RG exists — list resources
                 res_proc = _az_run(
                     ["az", "resource", "list", "-g", rg_name,
-                     "--query", "[].{name:name, type:type, location:location, id:id}",
+                     "--query", "[].{name:name, type:type, location:location, id:id, tags:tags}",
                      "-o", "json"], check=True,
                 )
                 resources = json.loads(res_proc.stdout)
@@ -2858,6 +2935,7 @@ def _get_deployed_resources_sync(ws_name: str, rg_name: str) -> dict:
                         "fullType": r["type"],
                         "location": r.get("location", ""),
                         "id": r.get("id", ""),
+                        "tags": r.get("tags") or {},
                     })
                 logger.info("Found %d Azure resources in RG '%s'", len(resources), rg_name)
         except Exception as e:

@@ -86,6 +86,11 @@ def _ps_hashtable_literal(values: dict[str, str]) -> str:
     entries = [f"{_ps_single_quoted(k)}={_ps_single_quoted(v)}" for k, v in values.items()]
     return "@{" + ";".join(entries) + "}"
 
+
+def _ps_array_literal(values: Any) -> str:
+    return "@(" + ",".join(_ps_single_quoted(value) for value in values) + ")"
+
+
 def _pipeline_substep_name(kind: str) -> str:
     normalized = kind.strip()
     sidecar_match = re.match(r"Sidecar Pipeline:\s*(.+)", normalized, re.IGNORECASE)
@@ -322,6 +327,10 @@ def _build_deploy_args(config: dict[str, Any]) -> list[str]:
             params.append(f"-ClaimEventRatePerMinute {config['claim_event_rate_per_minute']}")
         if config.get("dicom_toolkit_path"):
             params.append(f"-DicomToolkitPath {_ps_single_quoted(config['dicom_toolkit_path'])}")
+        if config.get("cardiology_app_path"):
+            params.append(f"-CardiologyAppPath {_ps_single_quoted(config['cardiology_app_path'])}")
+        if config.get("cardiology_app_users"):
+            params.append(f"-CardiologyAppUsers {_ps_array_literal(config['cardiology_app_users'])}")
         if config.get("capacity_subscription_id"):
             params.append(f"-CapacitySubscriptionId {_ps_single_quoted(config['capacity_subscription_id'])}")
         if config.get("capacity_resource_group"):
@@ -384,6 +393,8 @@ def _build_deploy_args(config: dict[str, Any]) -> list[str]:
             params.append("-SkipOpsAgent")
         if config.get("skip_graph_agent"):
             params.append("-SkipGraphAgent")
+        if config.get("skip_cardiology_app"):
+            params.append("-SkipCardiologyApp")
         if config.get("phase2_only"):
             params.append("-Phase2")
         if config.get("phase3_only"):
@@ -392,6 +403,8 @@ def _build_deploy_args(config: dict[str, Any]) -> list[str]:
             params.append("-Phase4")
         if config.get("phase7_only"):
             params.append("-Phase7")
+        if config.get("phase8_only"):
+            params.append("-Phase8")
 
         params.append(f"-Tags {_ps_hashtable_literal(tags)}")
 
@@ -422,6 +435,10 @@ def _build_deploy_args(config: dict[str, Any]) -> list[str]:
         args += ["-ClaimEventRatePerMinute", str(config["claim_event_rate_per_minute"])]
     if config.get("dicom_toolkit_path"):
         args += ["-DicomToolkitPath", config["dicom_toolkit_path"]]
+    if config.get("cardiology_app_path"):
+        args += ["-CardiologyAppPath", config["cardiology_app_path"]]
+    if config.get("cardiology_app_users"):
+        args += ["-CardiologyAppUsers", ",".join(str(user) for user in config["cardiology_app_users"])]
     if config.get("capacity_subscription_id"):
         args += ["-CapacitySubscriptionId", config["capacity_subscription_id"]]
     if config.get("capacity_resource_group"):
@@ -485,6 +502,8 @@ def _build_deploy_args(config: dict[str, Any]) -> list[str]:
         args.append("-SkipOpsAgent")
     if config.get("skip_graph_agent"):
         args.append("-SkipGraphAgent")
+    if config.get("skip_cardiology_app"):
+        args.append("-SkipCardiologyApp")
 
     if config.get("phase2_only"):
         args.append("-Phase2")
@@ -494,6 +513,8 @@ def _build_deploy_args(config: dict[str, Any]) -> list[str]:
         args.append("-Phase4")
     if config.get("phase7_only"):
         args.append("-Phase7")
+    if config.get("phase8_only"):
+        args.append("-Phase8")
 
     return args
 

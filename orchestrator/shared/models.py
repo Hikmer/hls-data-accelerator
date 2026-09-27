@@ -71,6 +71,10 @@ class DeploymentConfig(BaseModel):
     skip_graph_agent: bool = False
     payer_ops_email: str = ""
     claim_event_rate_per_minute: int = 60
+    skip_cardiology_app: bool = False
+    phase8_only: bool = False
+    cardiology_app_path: str = ""
+    cardiology_app_users: list[str] = Field(default_factory=list)
     # Phase 3 / 4
     dicom_toolkit_path: str = ""
     alert_email: str = ""

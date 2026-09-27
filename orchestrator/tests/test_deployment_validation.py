@@ -5,7 +5,31 @@ import json
 
 import unittest
 
-from shared.deployment_validation import _eventhub_consumption_check, _quality_report_binding_check, effective_validation_config, fabric_runtime_expected, feature_presence_checks
+import urllib.error
+from unittest.mock import patch
+
+from shared.deployment_validation import (
+    _eventhub_consumption_check,
+    _quality_report_binding_check,
+    cardiology_app_check,
+    effective_validation_config,
+    fabric_runtime_expected,
+    feature_presence_checks,
+    runtime_feature_checks,
+)
+
+
+class _AzResult:
+    def __init__(self, stdout: str = "", returncode: int = 0, stderr: str = "") -> None:
+        self.stdout = stdout
+        self.returncode = returncode
+        self.stderr = stderr
+
+
+_CARDIOLOGY_APP_LIST = json.dumps([
+    {"name": "hds-dicom-proxy", "fqdn": "proxy.example.test", "tags": {"hls-workload": "dicom-proxy"}},
+    {"name": "cardioe2e-app", "fqdn": "cardio.example.test", "tags": {"hls-workload": "cardiology-app"}},
+])
 
 
 class DeploymentValidationTests(unittest.TestCase):
@@ -59,6 +83,7 @@ class DeploymentValidationTests(unittest.TestCase):
                 "skip_activator": True,
                 "skip_quality_measures": True,
                 "skip_phase7": True,
+                "skip_cardiology_app": True,
             },
         )
 
@@ -229,6 +254,113 @@ class DeploymentValidationTests(unittest.TestCase):
         self.assertNotIn("HDS Bronze lakehouse", names)
         self.assertNotIn("Imaging report", names)
         self.assertNotIn("Population health report", names)
+        self.assertNotIn("Cardiology app Container App", names)
+
+    def test_phase8_validation_selects_only_cardiology_checks(self) -> None:
+        config = effective_validation_config({
+            "phase8_only": True,
+            "continue_from_instance_id": "prior-full-run",
+            "skip_fabric": False,
+            "skip_hds_pipelines": False,
+            "skip_data_agents": False,
+            "skip_imaging": False,
+            "skip_ontology": False,
+            "skip_activator": False,
+            "skip_quality_measures": False,
+            "skip_phase7": False,
+            "skip_payer_rti": False,
+            "alert_email": "alerts@example.test",
+            "payer_ops_email": "payer@example.test",
+        })
+
+        self.assertFalse(fabric_runtime_expected(config))
+        checks = feature_presence_checks({"workspace": {"id": "ws"}, "azure": [], "fabric": []}, config)
+
+        self.assertEqual([check["name"] for check in checks], ["Cardiology app Container App"])
+        self.assertEqual(checks[0]["status"], "fail")
+
+    def test_full_deploy_can_deselect_the_cardiology_app(self) -> None:
+        resources = {
+            "workspace": {"id": "ws"},
+            "fabric": [],
+            "azure": [{
+                "name": "cardioe2e-app",
+                "fullType": "Microsoft.App/containerApps",
+                "id": "/subscriptions/sub/resourceGroups/rg-test/providers/Microsoft.App/containerApps/cardioe2e-app",
+                "tags": {"hls-workload": "cardiology-app"},
+            }],
+        }
+        base = {
+            "skip_fabric": True,
+            "skip_hds_pipelines": True,
+            "skip_data_agents": True,
+            "skip_imaging": True,
+            "skip_ontology": True,
+            "skip_activator": True,
+            "skip_quality_measures": True,
+            "skip_phase7": True,
+            "resource_group_name": "rg-test",
+        }
+
+        def unused_az_run(args):
+            raise AssertionError(f"no CLI call expected: {args}")
+
+        skipped = {**base, "skip_cardiology_app": True}
+        self.assertEqual(feature_presence_checks(resources, skipped), [])
+        self.assertEqual(runtime_feature_checks(resources, skipped, unused_az_run, lambda: None), [])
+
+        selected = {**base, "skip_cardiology_app": False}
+        presence = feature_presence_checks(resources, selected)
+        self.assertEqual([check["name"] for check in presence], ["Cardiology app Container App"])
+        self.assertEqual(presence[0]["status"], "pass")
+
+    def test_cardiology_health_passes_on_status_ok(self) -> None:
+        captured: list[list[str]] = []
+
+        def az_run(args):
+            captured.append(args)
+            return _AzResult(_CARDIOLOGY_APP_LIST)
+
+        with patch(
+            "shared.deployment_validation._url_bytes",
+            return_value=json.dumps({"status": "ok", "profile": "cardio", "revision": "1"}).encode(),
+        ) as url_bytes:
+            result = cardiology_app_check(
+                {"resource_group_name": "rg-test", "expected_subscription_id": "sub"},
+                az_run,
+            )
+
+        self.assertEqual(result["status"], "pass")
+        url_bytes.assert_called_once_with("https://cardio.example.test/api/health", timeout=30)
+        self.assertIn("rg-test", captured[0])
+        self.assertIn("--subscription", captured[0])
+
+    def test_cardiology_health_fails_on_non_ok_status(self) -> None:
+        with patch(
+            "shared.deployment_validation._url_bytes",
+            return_value=json.dumps({"status": "degraded"}).encode(),
+        ):
+            result = cardiology_app_check(
+                {"resource_group_name": "rg-test"},
+                lambda args: _AzResult(_CARDIOLOGY_APP_LIST),
+            )
+
+        self.assertEqual(result["status"], "fail")
+        self.assertIn("status=degraded", result["detail"])
+
+    def test_cardiology_health_fails_when_unreachable(self) -> None:
+        with patch(
+            "shared.deployment_validation._url_bytes",
+            side_effect=urllib.error.URLError("no route to host"),
+        ), patch("shared.deployment_validation.time.sleep") as sleep:
+            result = cardiology_app_check(
+                {"resource_group_name": "rg-test"},
+                lambda args: _AzResult(_CARDIOLOGY_APP_LIST),
+            )
+
+        self.assertEqual(result["status"], "fail")
+        self.assertIn("attempt 3/3", result["detail"])
+        self.assertEqual(sleep.call_count, 2)
 
 
 if __name__ == "__main__":
