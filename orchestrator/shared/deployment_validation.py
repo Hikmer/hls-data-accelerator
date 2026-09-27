@@ -467,7 +467,7 @@ def _cardiology_auth_config_problem(config: dict[str, Any], app_name: str, fqdn:
                    for upn in config.get("cardiology_app_users") or [] if upn}
         if assigned != wanted:
             return f"sign-in assignments differ from the requested accounts ({len(assigned)} assigned, {len(wanted)} requested)"
-    except (KeyError, TypeError, AttributeError, RuntimeError, json.JSONDecodeError) as exc:
+    except (KeyError, TypeError, AttributeError, RuntimeError, ValueError) as exc:  # ValueError: bad JSON or URL
         return f"could not verify the sign-in configuration: {exc}"
     return ""
 

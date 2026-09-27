@@ -406,6 +406,7 @@ class DeploymentValidationTests(unittest.TestCase):
             ("API excluded from auth", {"/": (302, sign_in), "/api/activity": (200, "")}, good, {}, "fail"),
             ("redirect names another client", {"/": (302, f"{authorize}?redirect_uri={callback}&client_id=stale"), "/api/activity": (401, "")}, good, {}, "fail"),
             ("redirect has no callback", {"/": (302, f"{authorize}?client_id=app"), "/api/activity": (401, "")}, good, {}, "fail"),
+            ("malformed redirect", {"/": (302, "https://["), "/api/activity": (401, "")}, good, {}, "fail"),
             ("callback secret missing", protected, variant(secrets=[]), {}, "fail"),
             ("installed secret revoked", protected, variant(secret_value="revoked"), {}, "fail"),
             ("empty auth output", protected, variant(auth=None), {}, "fail"),
