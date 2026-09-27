@@ -38,6 +38,29 @@ def _azure(resources: dict[str, Any], full_type: str, *name_parts: str) -> list[
     ]
 
 
+CARDIOLOGY_WORKLOAD_TAG = "hls-workload"
+CARDIOLOGY_WORKLOAD_VALUE = "cardiology-app"
+
+
+def cardiology_app_resources(azure_resources: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Container Apps tagged as the Phase 8 cardiology workload."""
+    return [
+        resource
+        for resource in azure_resources or []
+        if str(resource.get("fullType") or resource.get("type") or "").lower() == "microsoft.app/containerapps"
+        and str((resource.get("tags") or {}).get(CARDIOLOGY_WORKLOAD_TAG) or "").strip().lower() == CARDIOLOGY_WORKLOAD_VALUE
+    ]
+
+
+def cardiology_app_expected(config: dict[str, Any]) -> bool:
+    """Phase 8 runs in a full deploy unless skipped, and in phase8-only mode."""
+    if config.get("phase8_only"):
+        return True
+    if config.get("skip_cardiology_app", False):
+        return False
+    return not any(config.get(field) for field in ("phase2_only", "phase3_only", "phase4_only", "phase7_only"))
+
+
 def _legacy_continuation_requires_fabric(config: dict[str, Any]) -> bool:
     """Recognize runs created before reuse_fabric_rti existed."""
     if not config.get("continue_from_instance_id"):
@@ -67,16 +90,18 @@ def fabric_runtime_expected(config: dict[str, Any]) -> bool:
 def effective_validation_config(config: dict[str, Any]) -> dict[str, Any]:
     """Return the feature set that the selected phase-only mode actually runs."""
     effective = dict(config)
-    if any(effective.get(field) for field in ("phase2_only", "phase3_only", "phase4_only", "phase7_only")):
+    if any(effective.get(field) for field in ("phase2_only", "phase3_only", "phase4_only", "phase7_only", "phase8_only")):
         effective["continue_from_instance_id"] = ""
     if effective.get("phase2_only"):
-        effective.update(skip_data_agents=True, skip_imaging=True, skip_ontology=True, skip_activator=True, skip_quality_measures=True, skip_phase7=True)
+        effective.update(skip_data_agents=True, skip_imaging=True, skip_ontology=True, skip_activator=True, skip_quality_measures=True, skip_phase7=True, skip_cardiology_app=True)
     elif effective.get("phase3_only"):
-        effective.update(skip_fabric=True, reuse_fabric_rti=False, skip_hds_pipelines=True, skip_data_agents=True, skip_ontology=True, skip_activator=True, skip_quality_measures=True, skip_phase7=True)
+        effective.update(skip_fabric=True, reuse_fabric_rti=False, skip_hds_pipelines=True, skip_data_agents=True, skip_ontology=True, skip_activator=True, skip_quality_measures=True, skip_phase7=True, skip_cardiology_app=True)
     elif effective.get("phase4_only"):
-        effective.update(skip_fabric=True, reuse_fabric_rti=False, skip_hds_pipelines=True, skip_imaging=True, skip_quality_measures=True, skip_phase7=True)
+        effective.update(skip_fabric=True, reuse_fabric_rti=False, skip_hds_pipelines=True, skip_imaging=True, skip_quality_measures=True, skip_phase7=True, skip_cardiology_app=True)
     elif effective.get("phase7_only"):
-        effective.update(skip_fabric=True, reuse_fabric_rti=False, skip_hds_pipelines=True, skip_data_agents=True, skip_imaging=True, skip_ontology=True, skip_activator=True, skip_quality_measures=True, skip_phase7=False)
+        effective.update(skip_fabric=True, reuse_fabric_rti=False, skip_hds_pipelines=True, skip_data_agents=True, skip_imaging=True, skip_ontology=True, skip_activator=True, skip_quality_measures=True, skip_phase7=False, skip_cardiology_app=True)
+    elif effective.get("phase8_only"):
+        effective.update(skip_fabric=True, reuse_fabric_rti=False, skip_hds_pipelines=True, skip_data_agents=True, skip_imaging=True, skip_ontology=True, skip_activator=True, skip_quality_measures=True, skip_phase7=True, skip_cardiology_app=False)
     return effective
 
 
@@ -157,6 +182,14 @@ def feature_presence_checks(resources: dict[str, Any], config: dict[str, Any]) -
         if not config.get("skip_payer_activator", False) and config.get("payer_ops_email"):
             found = _items(resources, "Reflex", "payer")
             checks.append(_check("Payer operations Activator", bool(found), found[0].get("name", "Missing") if found else "Missing"))
+
+    if cardiology_app_expected(config):
+        apps = cardiology_app_resources(resources.get("azure") or [])
+        checks.append(_check(
+            "Cardiology app Container App",
+            bool(apps),
+            apps[0].get("name", "Missing") if apps else f"No Microsoft.App/containerApps resource tagged {CARDIOLOGY_WORKLOAD_TAG}={CARDIOLOGY_WORKLOAD_VALUE}",
+        ))
 
     return checks
 
@@ -248,6 +281,59 @@ def _proxy_viewer_check(resources: dict[str, Any], config: dict[str, Any], az_ru
         return _check("OHIF HTTP availability", len(bundle) > 1024, f"proxy-hosted HTTP 200; entry bundle {len(bundle)} bytes")
     except Exception as exc:
         return _check("OHIF HTTP availability", False, f"{type(exc).__name__}: {exc}")
+
+
+CARDIOLOGY_HEALTH_CHECK_NAME = "Cardiology app health"
+
+
+def _cardiology_app_fqdn(config: dict[str, Any], az_run: Callable[..., Any]) -> tuple[str, str]:
+    """Resolve the tagged cardiology Container App ingress FQDN, or an error detail."""
+    resource_group = str(config.get("resource_group_name") or "")
+    if not resource_group:
+        return "", "Resource group name is not configured"
+    args = [
+        "az", "containerapp", "list",
+        "-g", resource_group,
+        "--query", "[].{name:name, fqdn:properties.configuration.ingress.fqdn, tags:tags}",
+        "-o", "json",
+    ]
+    subscription = config.get("expected_subscription_id")
+    if subscription:
+        args.extend(["--subscription", subscription])
+    proc = az_run(args)
+    if proc.returncode != 0:
+        return "", f"Could not list Container Apps: {str(proc.stderr or '').strip()[:200]}"
+    try:
+        apps = json.loads(proc.stdout or "[]")
+    except json.JSONDecodeError as exc:
+        return "", f"Container App list response invalid: {exc}"
+    for app in apps:
+        tags = app.get("tags") or {}
+        if str(tags.get(CARDIOLOGY_WORKLOAD_TAG) or "").strip().lower() != CARDIOLOGY_WORKLOAD_VALUE:
+            continue
+        fqdn = str(app.get("fqdn") or "")
+        if not fqdn:
+            return "", f"Container App '{app.get('name')}' has no ingress FQDN"
+        return fqdn, ""
+    return "", f"No Container App tagged {CARDIOLOGY_WORKLOAD_TAG}={CARDIOLOGY_WORKLOAD_VALUE} in {resource_group}"
+
+
+def cardiology_app_check(config: dict[str, Any], az_run: Callable[..., Any]) -> dict[str, str]:
+    """GET https://<fqdn>/api/health on the tagged cardiology Container App."""
+    fqdn, error = _cardiology_app_fqdn(config, az_run)
+    if not fqdn:
+        return _check(CARDIOLOGY_HEALTH_CHECK_NAME, False, error)
+    last_error = "Cardiology app health did not respond"
+    for attempt in range(1, 4):
+        try:
+            payload = json.loads(_url_bytes(f"https://{fqdn}/api/health", timeout=30))
+            status = payload.get("status")
+            return _check(CARDIOLOGY_HEALTH_CHECK_NAME, status == "ok", f"status={status}, fqdn={fqdn}")
+        except Exception as exc:
+            last_error = f"attempt {attempt}/3 {type(exc).__name__}: {exc}"
+            if attempt < 3:
+                time.sleep(10)
+    return _check(CARDIOLOGY_HEALTH_CHECK_NAME, False, last_error)
 
 
 def _eventhub_consumption_check(resources: dict[str, Any], config: dict[str, Any], az_run: Callable[..., Any], entity_name: str) -> dict[str, str]:
@@ -374,4 +460,6 @@ def runtime_feature_checks(
     if not config.get("skip_quality_measures", False):
         checks.append(_quality_report_binding_check(resources, fabric_client_factory))
         checks.append(_powerbi_query_check(resources, config, az_run, "Population Health & Quality Semantic Model", "EVALUATE ROW(\"Rows\", COUNTROWS('agg_quality_measures'))"))
+    if cardiology_app_expected(config):
+        checks.append(cardiology_app_check(config, az_run))
     return checks

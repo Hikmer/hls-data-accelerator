@@ -246,7 +246,7 @@ def deploy_all_orchestrator(context):
             "status": status,
             "detail": detail,
             "completedPhases": len([p for p in phases if p.get("status") == "succeeded"]),
-            "totalPhases": 12,
+            "totalPhases": 13,
             "resources": resources,
         })
 
@@ -389,6 +389,18 @@ def deploy_all_orchestrator(context):
     else:
         phases.append({"phase": "Phase 7: Payer RTI & Ops", "status": "skipped"})
 
+    # ── Phase 8: Cardiology App ───────────────────────────────────
+    if not config.get("skip_cardiology_app"):
+        update_status("Phase 8: Cardiology App", "running")
+        phase8_input = {"config": config, "resources": resources}
+        result = yield context.call_activity_with_retry(
+            "activity_deploy_cardiology_app", RETRY_POLICY, phase8_input
+        )
+        resources.update(result.get("resources", {}))
+        phases.append({"phase": result["phase"], "status": "succeeded", "duration": result["duration_seconds"]})
+    else:
+        phases.append({"phase": "Phase 8: Cardiology App", "status": "skipped"})
+
 
     # ── Complete ──────────────────────────────────────────────────
     update_status("Deployment Complete", "succeeded")
@@ -525,6 +537,13 @@ def activity_deploy_quality_measures(input_data: dict) -> dict:
 def activity_deploy_payer_rti(input_data: dict) -> dict:
     """Phase 7: Payer RTI and operations agents."""
     from activities.deploy_payer_rti import run
+    return run(input_data["config"], input_data["resources"])
+
+
+@app.activity_trigger(input_name="input_data")
+def activity_deploy_cardiology_app(input_data: dict) -> dict:
+    """Phase 8: Cardiology app Container App."""
+    from activities.deploy_cardiology_app import run
     return run(input_data["config"], input_data["resources"])
 
 
