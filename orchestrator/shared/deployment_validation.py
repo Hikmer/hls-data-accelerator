@@ -371,26 +371,57 @@ def _unauthenticated_response(fqdn: str, path: str, browser: bool) -> tuple[int,
         connection.close()
 
 
-def _cardiology_auth_secret_problem(config: dict[str, Any], app_name: str, az_run: Callable[..., Any]) -> str:
-    """The client secret the sign-in config references must exist, or callbacks fail."""
+def _az_json(az_run: Callable[..., Any], args: list[str]) -> Any:
+    proc = az_run([*args, "-o", "json"])
+    if proc.returncode != 0:
+        raise RuntimeError(f"{' '.join(args[:3])} failed")
+    return json.loads(proc.stdout or "null")
+
+
+def _cardiology_auth_config_problem(config: dict[str, Any], app_name: str, az_run: Callable[..., Any]) -> str:
+    """The control-plane access policy the deployment script establishes.
+
+    Redirect every unauthenticated request except /api/health, keep the client
+    secret the callback redeems codes with, require app assignment, and assign
+    exactly the deploying user plus cardiology_app_users.
+    """
     scope = ["-g", str(config.get("resource_group_name") or ""), "-n", app_name]
     if config.get("expected_subscription_id"):
         scope += ["--subscription", str(config["expected_subscription_id"])]
-    auth = az_run(["az", "containerapp", "auth", "show", *scope, "-o", "json"])
-    secrets = az_run(["az", "containerapp", "secret", "list", *scope, "--query", "[].name", "-o", "json"])
-    if auth.returncode != 0 or secrets.returncode != 0:
-        return "could not read the sign-in configuration"
     try:
-        registration = json.loads(auth.stdout or "{}")["identityProviders"]["azureActiveDirectory"]["registration"]
-        wanted, present = registration.get("clientSecretSettingName"), json.loads(secrets.stdout or "[]")
-    except (KeyError, TypeError, json.JSONDecodeError):
-        return "sign-in configuration has no Entra registration"
-    return "" if wanted and wanted in present else f"client secret '{wanted}' is missing from the app"
+        auth = _az_json(az_run, ["az", "containerapp", "auth", "show", *scope])
+        validation = auth.get("globalValidation") or {}
+        registration = auth["identityProviders"]["azureActiveDirectory"]["registration"]
+        if not (auth.get("platform") or {}).get("enabled") or validation.get("unauthenticatedClientAction") != "RedirectToLoginPage":
+            return "sign-in does not redirect unauthenticated visitors"
+        if list(validation.get("excludedPaths") or []) != ["/api/health"]:
+            return f"unexpected anonymous paths {validation.get('excludedPaths')}"
+        secrets = _az_json(az_run, ["az", "containerapp", "secret", "list", *scope, "--query", "[].name"]) or []
+        if registration.get("clientSecretSettingName") not in secrets:
+            return f"client secret '{registration.get('clientSecretSettingName')}' is missing from the app"
+
+        sp = _az_json(az_run, ["az", "ad", "sp", "show", "--id", str(registration.get("clientId"))])
+        if sp.get("appRoleAssignmentRequired") is not True:
+            return "app assignment is not required"
+        assigned: set[str] = set()
+        url = f"https://graph.microsoft.com/v1.0/servicePrincipals/{sp['id']}/appRoleAssignedTo"
+        while url:  # Graph pages this collection
+            page = _az_json(az_run, ["az", "rest", "--method", "GET", "--url", url])
+            assigned |= {a["principalId"] for a in page.get("value", [])}
+            url = page.get("@odata.nextLink")
+        wanted = {str(_az_json(az_run, ["az", "ad", "signed-in-user", "show", "--query", "id"]))}
+        wanted |= {str(_az_json(az_run, ["az", "ad", "user", "show", "--id", upn, "--query", "id"]))
+                   for upn in config.get("cardiology_app_users") or [] if upn}
+        if assigned != wanted:
+            return f"sign-in assignments differ from the requested accounts ({len(assigned)} assigned, {len(wanted)} requested)"
+    except (KeyError, TypeError, RuntimeError, json.JSONDecodeError) as exc:
+        return f"could not verify the sign-in configuration: {exc}"
+    return ""
 
 
 def cardiology_sign_in_check(config: dict[str, Any], az_run: Callable[..., Any]) -> dict[str, str]:
-    """Anonymous browsers are sent to Entra sign-in, anonymous API reads are
-    refused, and the sign-in callback has the client secret it needs."""
+    """At the edge, anonymous browsers go to Entra sign-in and anonymous API reads
+    are refused; on the control plane, the full access policy holds."""
     fqdn, app_name, error = _cardiology_app(config, az_run)
     if not fqdn:
         return _check(CARDIOLOGY_SIGN_IN_CHECK_NAME, False, error)
@@ -401,10 +432,10 @@ def cardiology_sign_in_check(config: dict[str, Any], az_run: Callable[..., Any])
     except Exception as exc:
         return _check(CARDIOLOGY_SIGN_IN_CHECK_NAME, False, f"{type(exc).__name__}: {exc}")
     redirected = page_status == 302 and location.startswith(f"https://login.microsoftonline.com/{tenant}/")
-    secret_problem = _cardiology_auth_secret_problem(config, app_name, az_run)
-    return _check(CARDIOLOGY_SIGN_IN_CHECK_NAME, redirected and api_status == 401 and not secret_problem,
+    policy_problem = _cardiology_auth_config_problem(config, app_name, az_run)
+    return _check(CARDIOLOGY_SIGN_IN_CHECK_NAME, redirected and api_status == 401 and not policy_problem,
                   f"browser / -> {page_status} {location[:80]}; anonymous /api/activity -> {api_status}"
-                  + (f"; {secret_problem}" if secret_problem else ""))
+                  + (f"; {policy_problem}" if policy_problem else ""))
 
 
 def _eventhub_consumption_check(resources: dict[str, Any], config: dict[str, Any], az_run: Callable[..., Any], entity_name: str) -> dict[str, str]:

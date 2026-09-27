@@ -141,14 +141,16 @@ if (-not $acrName) { throw "The cardiology app registry was not found in $Resour
 Write-Host "  ✓ Infrastructure ready (registry $acrName)" -ForegroundColor Green
 
 # An existing cardiology revision must never be served without sign-in. If the
-# app runs the real image but its auth config is not enforcing (an earlier run
-# failed part-way), take it offline before any other work.
+# app runs the real image but its auth config is not enforcing exactly the
+# intended policy (redirect everything except /api/health), take it offline
+# before any other work: an earlier run may have failed part-way.
 if ($hasRegistryImage) {
     $authShow = Invoke-Az @("containerapp", "auth", "show", "-g", $ResourceGroupName, "-n", $appName, "-o", "json") -AllowFailure
     $enforcing = $false
     try {
         $cfg = $authShow.Out | ConvertFrom-Json
-        $enforcing = $cfg.platform.enabled -eq $true -and $cfg.globalValidation.unauthenticatedClientAction -eq "RedirectToLoginPage"
+        $enforcing = $cfg.platform.enabled -eq $true -and $cfg.globalValidation.unauthenticatedClientAction -eq "RedirectToLoginPage" -and
+            (@($cfg.globalValidation.excludedPaths) -join ",") -eq "/api/health"
     } catch { $enforcing = $false }
     if (-not $enforcing) {
         $activeRevisions = (Invoke-Az @("containerapp", "revision", "list", "-g", $ResourceGroupName, "-n", $appName,
@@ -227,9 +229,11 @@ $verified = @(Get-AppAssignments | ForEach-Object { $_ } | ForEach-Object { $_.p
 if (($verified -join ",") -ne (@($allowed | Sort-Object) -join ",")) { throw "App assignments do not match the requested sign-in accounts." }
 Write-Host "  ✓ Sign-in limited to $($verified.Count) assigned account(s)" -ForegroundColor Green
 
-# A fresh secret each deploy; handed to Container Apps (and back to the template
-# for the revision deploy), never printed, cleared when the script ends.
-$secret = (Invoke-Az @("ad", "app", "credential", "reset", "--id", $appId, "--display-name", "container-apps-auth",
+# A new credential per deploy, ADDED beside the working one so a failure before
+# cutover leaves sign-in intact; superseded credentials are removed only after
+# the new one is installed and verified. Never printed; cleared at script end.
+$credentialName = "container-apps-auth-$(Get-Date -Format 'yyyyMMddHHmmss')"
+$secret = (Invoke-Az @("ad", "app", "credential", "reset", "--id", $appId, "--append", "--display-name", $credentialName,
     "--years", "1", "--query", "password", "-o", "tsv")).Out.Trim()
 Invoke-Az @("containerapp", "auth", "microsoft", "update", "-g", $ResourceGroupName, "-n", $appName,
     "--client-id", $appId, "--client-secret", $secret,
@@ -338,6 +342,13 @@ if ($builtTags.Code -eq 0 -and ($builtTags.Out -split "`n") -contains $tag) {
     if (-not $healthOk -or $problem) { throw "Cardiology app did not become ready at $appUrl within 5 minutes: $problem" }
     $problem = Test-AuthConfig
     if ($problem) { throw "Sign-in configuration broke during the revision deploy: $problem" }
+
+    # Cut over: the new credential is live, so retire the ones it replaced.
+    $superseded = @(((Invoke-Az @("ad", "app", "credential", "list", "--id", $appId, "-o", "json")).Out | ConvertFrom-Json) |
+        Where-Object { "$($_.displayName)".StartsWith("container-apps-auth") -and $_.displayName -ne $credentialName })
+    foreach ($old in $superseded) {
+        Invoke-Az @("ad", "app", "credential", "delete", "--id", $appId, "--key-id", $old.keyId, "-o", "none") | Out-Null
+    }
 } finally { $browser.Dispose(); $secret = $null }
 
 Write-Host "  ✓ $appUrl healthy on revision $tag; unauthenticated visitors are sent to sign-in" -ForegroundColor Green

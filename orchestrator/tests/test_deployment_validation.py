@@ -375,27 +375,56 @@ class DeploymentValidationTests(unittest.TestCase):
         self.assertIn("attempt 3/3", result["detail"])
         self.assertEqual(sleep.call_count, 2)
 
-    def test_cardiology_sign_in_requires_tenant_redirect_refused_api_and_secret(self) -> None:
+    def test_cardiology_sign_in_requires_edge_protection_and_exact_access_policy(self) -> None:
         tenant = "8d038e6a-9b7d-4cb8-bbcf-e84dff156478"
-        config = {"resource_group_name": "rg-test", "expected_tenant_id": tenant}
         sign_in = f"https://login.microsoftonline.com/{tenant}/oauth2/v2.0/authorize?client_id=x"
-        auth = json.dumps({"identityProviders": {"azureActiveDirectory": {"registration": {"clientSecretSettingName": "microsoft-provider-authentication-secret"}}}})
         protected = {"/": (302, sign_in), "/api/activity": (401, "")}
-        with_secret = json.dumps(["microsoft-provider-authentication-secret"])
-        cases = [
-            (protected, with_secret, "pass"),
-            ({"/": (200, ""), "/api/activity": (200, "")}, with_secret, "fail"),  # auth off
-            ({"/": (302, "https://login.microsoftonline.com/other-tenant/oauth2"), "/api/activity": (401, "")}, with_secret, "fail"),
-            ({"/": (302, sign_in), "/api/activity": (200, "")}, with_secret, "fail"),  # API excluded from auth
-            (protected, json.dumps([]), "fail"),  # redirect works but callbacks cannot redeem the code
-        ]
-        for responses, secrets, expected in cases:
-            def az_run(args, secrets=secrets):
-                if "list" in args and "secret" not in args:
-                    return _AzResult(_CARDIOLOGY_APP_LIST)
-                return _AzResult(auth if "auth" in args else secrets)
+        good = {
+            "auth": {"platform": {"enabled": True},
+                     "globalValidation": {"unauthenticatedClientAction": "RedirectToLoginPage", "excludedPaths": ["/api/health"]},
+                     "identityProviders": {"azureActiveDirectory": {"registration": {"clientId": "app", "clientSecretSettingName": "microsoft-provider-authentication-secret"}}}},
+            "secrets": ["microsoft-provider-authentication-secret"],
+            "sp": {"id": "sp", "appRoleAssignmentRequired": True},
+            "pages": [{"value": [{"principalId": "deployer"}]}],
+        }
 
-            with self.subTest(responses=responses, secrets=secrets), patch(
+        def variant(**changes):
+            state = json.loads(json.dumps(good))
+            for key, value in changes.items():
+                state[key] = value
+            return state
+
+        extra_path = variant(auth={**good["auth"], "globalValidation": {**good["auth"]["globalValidation"], "excludedPaths": ["/api/health", "/api/admit"]}})
+        cases = [
+            ("protected with exact policy", protected, good, {}, "pass"),
+            ("auth off at the edge", {"/": (200, ""), "/api/activity": (200, "")}, good, {}, "fail"),
+            ("another tenant's sign-in", {"/": (302, "https://login.microsoftonline.com/other/oauth2"), "/api/activity": (401, "")}, good, {}, "fail"),
+            ("API excluded from auth", {"/": (302, sign_in), "/api/activity": (200, "")}, good, {}, "fail"),
+            ("callback secret missing", protected, variant(secrets=[]), {}, "fail"),
+            ("extra anonymous path", protected, extra_path, {}, "fail"),
+            ("assignment not required", protected, variant(sp={"id": "sp", "appRoleAssignmentRequired": False}), {}, "fail"),
+            ("removed user still assigned", protected, variant(pages=[{"value": [{"principalId": "deployer"}, {"principalId": "old"}]}]), {}, "fail"),
+            ("unwanted grant on page two", protected, variant(pages=[{"value": [{"principalId": "deployer"}], "@odata.nextLink": "next"}, {"value": [{"principalId": "old"}]}]), {}, "fail"),
+            ("requested user not assigned", protected, good, {"cardiology_app_users": ["new@example.test"]}, "fail"),
+        ]
+        for label, responses, state, extra_config, expected in cases:
+            pages = iter(state["pages"])
+
+            def az_run(args, state=state, pages=pages):
+                if args[:3] == ["az", "containerapp", "list"]:
+                    return _AzResult(_CARDIOLOGY_APP_LIST)
+                payload = {
+                    ("containerapp", "auth"): lambda: state["auth"],
+                    ("containerapp", "secret"): lambda: state["secrets"],
+                    ("ad", "sp"): lambda: state["sp"],
+                    ("rest", "--method"): lambda: next(pages),
+                    ("ad", "signed-in-user"): lambda: "deployer",
+                    ("ad", "user"): lambda: "new-user",
+                }[(args[1], args[2])]()
+                return _AzResult(json.dumps(payload))
+
+            config = {"resource_group_name": "rg-test", "expected_tenant_id": tenant, **extra_config}
+            with self.subTest(label), patch(
                 "shared.deployment_validation._unauthenticated_response",
                 side_effect=lambda fqdn, path, browser, r=responses: r[path],
             ):
