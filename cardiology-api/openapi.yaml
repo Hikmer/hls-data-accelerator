@@ -1,0 +1,355 @@
+openapi: 3.1.0
+info:
+  title: HLS Cardiology Read API
+  version: 1.0.0
+  license:
+    name: MIT
+    identifier: MIT
+  summary: Read-only cardiology subject, observation, and metric contract over the HLS data estate.
+  description: |
+    Consumed by the private caldova-cardio-e2e agent platform through its
+    CohortStore read port. This API is READ-ONLY by design: approvals, runs,
+    settings, dispatch outboxes, and receipts are commands owned by the app's
+    transactional store, never by the analytical estate.
+
+    Sources:
+      - Subject identity, conditions, and point observations: HDS Silver
+        projections of FHIR Patient / Condition / Observation.
+      - Device association: FHIR Device + DeviceAssociation (HDS Silver).
+      - Device windows: Eventhouse (synthetic cardiac-device feed).
+      - Metrics: reporting Gold, one governed definition per metric.
+
+    Identifiers: subjectId is the FHIR Patient logical id; deviceId is the
+    FHIR Device logical id. No separate cardiology identifier scheme exists.
+
+    Measures, codes, units, and staleness limits come from
+    measure-catalog.json in this directory. A measure with no observation is
+    reported as missing, never defaulted or simulated.
+
+    SYNTHETIC DATA ONLY. No PHI security, privacy, retention, or compliance
+    design exists for this deployment.
+servers:
+  - url: /
+security:
+  - entra: [Cardiology.Read]
+paths:
+  /v1/health:
+    get:
+      operationId: getHealth
+      summary: Per-source freshness. Callers label views stale from this, not from guesses.
+      responses:
+        "200":
+          description: Source freshness.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Health" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+  /v1/subjects:
+    get:
+      operationId: listSubjects
+      summary: Active subjects, optionally filtered by care setting.
+      description: Backs CohortStore.listActive and CohortStore.listByCareSetting.
+      parameters:
+        - name: careSetting
+          in: query
+          required: false
+          schema: { $ref: "#/components/schemas/CareSetting" }
+      responses:
+        "200":
+          description: Active subjects.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [dataClassification, catalogVersion, subjects]
+                properties:
+                  dataClassification: { $ref: "#/components/schemas/DataClassification" }
+                  catalogVersion: { type: string }
+                  subjects:
+                    type: array
+                    items: { $ref: "#/components/schemas/Subject" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+  /v1/subjects/{subjectId}:
+    get:
+      operationId: getSubject
+      summary: One subject with latest value per catalog measure.
+      description: Backs CohortStore.getById. Unknown ids return 404; nothing is fabricated.
+      parameters:
+        - $ref: "#/components/parameters/SubjectId"
+      responses:
+        "200":
+          description: Subject.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [dataClassification, catalogVersion, subject]
+                properties:
+                  dataClassification: { $ref: "#/components/schemas/DataClassification" }
+                  catalogVersion: { type: string }
+                  subject: { $ref: "#/components/schemas/Subject" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /v1/subjects/{subjectId}/observations:
+    get:
+      operationId: listObservations
+      summary: Time-ordered observations for one catalog measure.
+      parameters:
+        - $ref: "#/components/parameters/SubjectId"
+        - name: measure
+          in: query
+          required: true
+          schema: { $ref: "#/components/schemas/MeasureKey" }
+        - name: since
+          in: query
+          required: true
+          schema: { type: string, format: date-time }
+        - name: until
+          in: query
+          required: false
+          schema: { type: string, format: date-time }
+        - name: limit
+          in: query
+          required: false
+          schema: { type: integer, minimum: 1, maximum: 5000, default: 500 }
+      responses:
+        "200":
+          description: Observations, oldest first.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [dataClassification, measure, observations, truncated]
+                properties:
+                  dataClassification: { $ref: "#/components/schemas/DataClassification" }
+                  measure: { $ref: "#/components/schemas/MeasureKey" }
+                  observations:
+                    type: array
+                    items: { $ref: "#/components/schemas/Observation" }
+                  truncated:
+                    type: boolean
+                    description: True when more rows matched than limit.
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /v1/metrics/{metricId}:
+    get:
+      operationId: getMetric
+      summary: One governed Gold metric value with its definition.
+      parameters:
+        - name: metricId
+          in: path
+          required: true
+          schema: { type: string, pattern: "^[a-z0-9][a-z0-9-]{1,63}$" }
+        - name: periodStart
+          in: query
+          required: true
+          schema: { type: string, format: date }
+        - name: periodEnd
+          in: query
+          required: true
+          schema: { type: string, format: date }
+      responses:
+        "200":
+          description: Metric value.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/MetricValue" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+components:
+  securitySchemes:
+    entra:
+      type: oauth2
+      description: Microsoft Entra ID (brakekat tenant). App role Cardiology.Read is required.
+      flows:
+        clientCredentials:
+          tokenUrl: https://login.microsoftonline.com/8d038e6a-9b7d-4cb8-bbcf-e84dff156478/oauth2/v2.0/token
+          scopes:
+            Cardiology.Read: Read synthetic cardiology subjects, observations, and metrics.
+  parameters:
+    SubjectId:
+      name: subjectId
+      in: path
+      required: true
+      description: FHIR Patient logical id.
+      schema: { type: string, pattern: "^[A-Za-z0-9\\-.]{1,64}$" }
+  responses:
+    BadRequest:
+      description: Invalid parameters.
+      content:
+        application/problem+json:
+          schema: { $ref: "#/components/schemas/Problem" }
+    Unauthorized:
+      description: Missing or invalid bearer token.
+      content:
+        application/problem+json:
+          schema: { $ref: "#/components/schemas/Problem" }
+    Forbidden:
+      description: Token lacks Cardiology.Read.
+      content:
+        application/problem+json:
+          schema: { $ref: "#/components/schemas/Problem" }
+    NotFound:
+      description: Unknown subject or metric.
+      content:
+        application/problem+json:
+          schema: { $ref: "#/components/schemas/Problem" }
+  schemas:
+    DataClassification:
+      type: string
+      const: synthetic
+    CareSetting:
+      type: string
+      enum: [inpatient, outpatient, home-monitored]
+    MeasureKey:
+      type: string
+      description: Key from measure-catalog.json; equals the platform scorer's MeasureSpec.key.
+      enum: [lactate, map, heartRate, spo2, deviceFlow]
+    Coding:
+      type: object
+      required: [system, code]
+      properties:
+        system: { type: string, format: uri }
+        code: { type: string }
+        display: { type: string }
+    Provenance:
+      type: object
+      required: [sourceSystem, sourceRecordId, ingestedAt]
+      properties:
+        sourceSystem:
+          type: string
+          enum: [hds-silver, eventhouse, reporting-gold]
+        sourceRecordId:
+          type: string
+          description: FHIR resource reference (e.g. Observation/abc) or Eventhouse row key.
+        ingestedAt: { type: string, format: date-time }
+        tags:
+          type: array
+          items: { $ref: "#/components/schemas/Coding" }
+          description: Carries FHIR meta.tag, including the synthetic-demo provenance tag.
+    Observation:
+      type: object
+      required: [measure, code, value, unit, effectiveAt, provenance]
+      properties:
+        measure: { $ref: "#/components/schemas/MeasureKey" }
+        code: { $ref: "#/components/schemas/Coding" }
+        value: { type: number }
+        unit: { type: string, description: UCUM unit from the catalog. }
+        effectiveAt: { type: string, format: date-time }
+        provenance: { $ref: "#/components/schemas/Provenance" }
+    LatestMeasure:
+      oneOf:
+        - type: object
+          required: [status, observation, stale]
+          properties:
+            status: { const: present }
+            observation: { $ref: "#/components/schemas/Observation" }
+            stale:
+              type: boolean
+              description: effectiveAt older than the catalog maxAgeSeconds for this measure.
+        - type: object
+          required: [status]
+          properties:
+            status: { const: missing }
+    Device:
+      type: object
+      required: [deviceId, kind, serial, associatedSince]
+      properties:
+        deviceId: { type: string, description: FHIR Device logical id. }
+        kind: { type: string }
+        serial: { type: string }
+        associatedSince: { type: string, format: date-time }
+        lastEventAt:
+          type: [string, "null"]
+          format: date-time
+          description: Latest Eventhouse event for this device; null when never seen.
+    Subject:
+      type: object
+      description: |
+        Maps to the platform CohortRecord: id=subjectId, observations[key] =
+        latest[key].observation.value when present and not stale, else null,
+        observedAt = max effectiveAt across present measures.
+      required: [subjectId, initials, ageBand, careSetting, primaryCondition, devices, latest]
+      properties:
+        subjectId: { type: string }
+        initials: { type: string, pattern: "^[A-Z]\\.[A-Z]\\.$" }
+        ageBand: { type: string, examples: ["60-69"] }
+        careSetting: { $ref: "#/components/schemas/CareSetting" }
+        primaryCondition: { $ref: "#/components/schemas/Coding" }
+        attendingRole:
+          type: [string, "null"]
+          description: From CareTeam/PractitionerRole; null when unassigned.
+        devices:
+          type: array
+          items: { $ref: "#/components/schemas/Device" }
+        latest:
+          type: object
+          description: One entry per catalog measure key; every key is always present.
+          required: [lactate, map, heartRate, spo2, deviceFlow]
+          properties:
+            lactate: { $ref: "#/components/schemas/LatestMeasure" }
+            map: { $ref: "#/components/schemas/LatestMeasure" }
+            heartRate: { $ref: "#/components/schemas/LatestMeasure" }
+            spo2: { $ref: "#/components/schemas/LatestMeasure" }
+            deviceFlow: { $ref: "#/components/schemas/LatestMeasure" }
+          additionalProperties: false
+    SourceFreshness:
+      type: object
+      required: [source, status]
+      properties:
+        source:
+          type: string
+          enum: [hds-silver, eventhouse, reporting-gold]
+        status:
+          type: string
+          enum: [fresh, stale, unavailable]
+        latestAt: { type: [string, "null"], format: date-time }
+    Health:
+      type: object
+      required: [dataClassification, catalogVersion, sources]
+      properties:
+        dataClassification: { $ref: "#/components/schemas/DataClassification" }
+        catalogVersion: { type: string }
+        sources:
+          type: array
+          items: { $ref: "#/components/schemas/SourceFreshness" }
+    MetricDefinition:
+      type: object
+      required: [metricId, version, numerator, denominator, exclusions, source]
+      properties:
+        metricId: { type: string }
+        version: { type: string }
+        numerator: { type: string }
+        denominator: { type: string }
+        exclusions: { type: string }
+        source: { type: string, description: Gold table(s) the metric is computed from. }
+    MetricValue:
+      type: object
+      required: [dataClassification, definition, periodStart, periodEnd, numerator, denominator, computedAt]
+      properties:
+        dataClassification: { $ref: "#/components/schemas/DataClassification" }
+        definition: { $ref: "#/components/schemas/MetricDefinition" }
+        periodStart: { type: string, format: date }
+        periodEnd: { type: string, format: date }
+        numerator: { type: integer, minimum: 0 }
+        denominator: { type: integer, minimum: 0 }
+        rate:
+          type: [number, "null"]
+          description: numerator/denominator; null when denominator is 0.
+        computedAt: { type: string, format: date-time }
+    Problem:
+      type: object
+      description: RFC 9457 problem details.
+      required: [type, title, status]
+      properties:
+        type: { type: string }
+        title: { type: string }
+        status: { type: integer }
+        detail: { type: string }

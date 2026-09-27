@@ -1,0 +1,50 @@
+{
+  "$comment": "Single source of truth for cardiology measures shared by the HLS cardiology read API and the caldova-cardio-e2e agent platform. Keys match the platform scorer's MeasureSpec.key. Codes identify what is measured; units are UCUM. maxAgeSeconds decides when a value is reported stale. SYNTHETIC DATA ONLY.",
+  "version": "1.0.0",
+  "localSystem": "https://brakekat.com/hls/cardiology/measures",
+  "measures": [
+    {
+      "key": "lactate",
+      "label": "Lactate",
+      "code": { "system": "http://loinc.org", "code": "2524-7", "display": "Lactate [Moles/volume] in Serum or Plasma" },
+      "unit": "mmol/L",
+      "source": "fhir-observation",
+      "maxAgeSeconds": 86400
+    },
+    {
+      "key": "map",
+      "label": "Mean arterial pressure",
+      "code": { "system": "http://loinc.org", "code": "8478-0", "display": "Mean blood pressure" },
+      "unit": "mm[Hg]",
+      "source": "fhir-observation",
+      "maxAgeSeconds": 86400
+    },
+    {
+      "key": "heartRate",
+      "label": "Heart rate",
+      "code": { "system": "http://loinc.org", "code": "8867-4", "display": "Heart rate" },
+      "unit": "/min",
+      "source": "fhir-observation",
+      "maxAgeSeconds": 86400,
+      "notes": "Not interchangeable with Heart rate by Pulse oximetry (LOINC 8889-8) from the Masimo stream; the API never substitutes one for the other."
+    },
+    {
+      "key": "spo2",
+      "label": "Oxygen saturation",
+      "code": { "system": "http://loinc.org", "code": "2708-6", "display": "Oxygen saturation in Arterial blood" },
+      "unit": "%",
+      "source": "fhir-observation",
+      "maxAgeSeconds": 86400,
+      "notes": "Same code the HLS canonical Synthea fixture already emits."
+    },
+    {
+      "key": "deviceFlow",
+      "label": "Device flow index",
+      "code": { "system": "https://brakekat.com/hls/cardiology/measures", "code": "device-flow-index", "display": "Synthetic cardiac-device flow index" },
+      "unit": "%",
+      "source": "cardiac-device-telemetry",
+      "maxAgeSeconds": 900,
+      "notes": "No standard code exists for this demonstration measure. Produced only by the synthetic cardiac-device feed."
+    }
+  ]
+}
