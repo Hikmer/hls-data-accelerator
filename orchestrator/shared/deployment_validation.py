@@ -294,9 +294,15 @@ CARDIOLOGY_HEALTH_CHECK_NAME = "Cardiology app health"
 
 def _cardiology_app_fqdn(config: dict[str, Any], az_run: Callable[..., Any]) -> tuple[str, str]:
     """Resolve the tagged cardiology Container App ingress FQDN, or an error detail."""
+    fqdn, _name, error = _cardiology_app(config, az_run)
+    return fqdn, error
+
+
+def _cardiology_app(config: dict[str, Any], az_run: Callable[..., Any]) -> tuple[str, str, str]:
+    """(fqdn, name, error) for the tagged cardiology Container App."""
     resource_group = str(config.get("resource_group_name") or "")
     if not resource_group:
-        return "", "Resource group name is not configured"
+        return "", "", "Resource group name is not configured"
     args = [
         "az", "containerapp", "list",
         "-g", resource_group,
@@ -308,20 +314,20 @@ def _cardiology_app_fqdn(config: dict[str, Any], az_run: Callable[..., Any]) -> 
         args.extend(["--subscription", subscription])
     proc = az_run(args)
     if proc.returncode != 0:
-        return "", f"Could not list Container Apps: {str(proc.stderr or '').strip()[:200]}"
+        return "", "", f"Could not list Container Apps: {str(proc.stderr or '').strip()[:200]}"
     try:
         apps = json.loads(proc.stdout or "[]")
     except json.JSONDecodeError as exc:
-        return "", f"Container App list response invalid: {exc}"
+        return "", "", f"Container App list response invalid: {exc}"
     for app in apps:
         tags = app.get("tags") or {}
         if str(tags.get(CARDIOLOGY_WORKLOAD_TAG) or "").strip().lower() != CARDIOLOGY_WORKLOAD_VALUE:
             continue
         fqdn = str(app.get("fqdn") or "")
         if not fqdn:
-            return "", f"Container App '{app.get('name')}' has no ingress FQDN"
-        return fqdn, ""
-    return "", f"No Container App tagged {CARDIOLOGY_WORKLOAD_TAG}={CARDIOLOGY_WORKLOAD_VALUE} in {resource_group}"
+            return "", "", f"Container App '{app.get('name')}' has no ingress FQDN"
+        return fqdn, str(app.get("name") or ""), ""
+    return "", "", f"No Container App tagged {CARDIOLOGY_WORKLOAD_TAG}={CARDIOLOGY_WORKLOAD_VALUE} in {resource_group}"
 
 
 def cardiology_app_check(config: dict[str, Any], az_run: Callable[..., Any]) -> dict[str, str]:
@@ -365,9 +371,27 @@ def _unauthenticated_response(fqdn: str, path: str, browser: bool) -> tuple[int,
         connection.close()
 
 
+def _cardiology_auth_secret_problem(config: dict[str, Any], app_name: str, az_run: Callable[..., Any]) -> str:
+    """The client secret the sign-in config references must exist, or callbacks fail."""
+    scope = ["-g", str(config.get("resource_group_name") or ""), "-n", app_name]
+    if config.get("expected_subscription_id"):
+        scope += ["--subscription", str(config["expected_subscription_id"])]
+    auth = az_run(["az", "containerapp", "auth", "show", *scope, "-o", "json"])
+    secrets = az_run(["az", "containerapp", "secret", "list", *scope, "--query", "[].name", "-o", "json"])
+    if auth.returncode != 0 or secrets.returncode != 0:
+        return "could not read the sign-in configuration"
+    try:
+        registration = json.loads(auth.stdout or "{}")["identityProviders"]["azureActiveDirectory"]["registration"]
+        wanted, present = registration.get("clientSecretSettingName"), json.loads(secrets.stdout or "[]")
+    except (KeyError, TypeError, json.JSONDecodeError):
+        return "sign-in configuration has no Entra registration"
+    return "" if wanted and wanted in present else f"client secret '{wanted}' is missing from the app"
+
+
 def cardiology_sign_in_check(config: dict[str, Any], az_run: Callable[..., Any]) -> dict[str, str]:
-    """Anonymous browsers are sent to Entra sign-in and anonymous API reads are refused."""
-    fqdn, error = _cardiology_app_fqdn(config, az_run)
+    """Anonymous browsers are sent to Entra sign-in, anonymous API reads are
+    refused, and the sign-in callback has the client secret it needs."""
+    fqdn, app_name, error = _cardiology_app(config, az_run)
     if not fqdn:
         return _check(CARDIOLOGY_SIGN_IN_CHECK_NAME, False, error)
     tenant = str(config.get("expected_tenant_id") or "")
@@ -377,8 +401,10 @@ def cardiology_sign_in_check(config: dict[str, Any], az_run: Callable[..., Any])
     except Exception as exc:
         return _check(CARDIOLOGY_SIGN_IN_CHECK_NAME, False, f"{type(exc).__name__}: {exc}")
     redirected = page_status == 302 and location.startswith(f"https://login.microsoftonline.com/{tenant}/")
-    return _check(CARDIOLOGY_SIGN_IN_CHECK_NAME, redirected and api_status == 401,
-                  f"browser / -> {page_status} {location[:80]}; anonymous /api/activity -> {api_status}")
+    secret_problem = _cardiology_auth_secret_problem(config, app_name, az_run)
+    return _check(CARDIOLOGY_SIGN_IN_CHECK_NAME, redirected and api_status == 401 and not secret_problem,
+                  f"browser / -> {page_status} {location[:80]}; anonymous /api/activity -> {api_status}"
+                  + (f"; {secret_problem}" if secret_problem else ""))
 
 
 def _eventhub_consumption_check(resources: dict[str, Any], config: dict[str, Any], az_run: Callable[..., Any], entity_name: str) -> dict[str, str]:

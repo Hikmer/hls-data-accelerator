@@ -31,6 +31,10 @@ param revision string = 'placeholder'
 @description('Additional resource tags.')
 param tags object = {}
 
+@description('Entra client secret for Container Apps sign-in. A container app deployment replaces the app\'s whole secret set, so every deployment after sign-in is configured must pass it back or sign-in callbacks break.')
+@secure()
+param authClientSecret string = ''
+
 var suffix = uniqueString(resourceGroup().id)
 var allTags = union(tags, { 'hls-workload': 'cardiology-app', dataClassification: 'synthetic-only' })
 var aiName = '${prefix}-ai-${suffix}'
@@ -171,6 +175,13 @@ resource app 'Microsoft.App/containerApps@2024-03-01' = {
           identity: appIdentity.id
         }
       ] : []
+      // Name fixed by `az containerapp auth microsoft update`.
+      secrets: empty(authClientSecret) ? [] : [
+        {
+          name: 'microsoft-provider-authentication-secret'
+          value: authClientSecret
+        }
+      ]
     }
     template: {
       containers: [

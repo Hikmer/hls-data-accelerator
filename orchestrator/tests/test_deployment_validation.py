@@ -375,22 +375,31 @@ class DeploymentValidationTests(unittest.TestCase):
         self.assertIn("attempt 3/3", result["detail"])
         self.assertEqual(sleep.call_count, 2)
 
-    def test_cardiology_sign_in_requires_tenant_redirect_and_refused_api(self) -> None:
+    def test_cardiology_sign_in_requires_tenant_redirect_refused_api_and_secret(self) -> None:
         tenant = "8d038e6a-9b7d-4cb8-bbcf-e84dff156478"
         config = {"resource_group_name": "rg-test", "expected_tenant_id": tenant}
         sign_in = f"https://login.microsoftonline.com/{tenant}/oauth2/v2.0/authorize?client_id=x"
+        auth = json.dumps({"identityProviders": {"azureActiveDirectory": {"registration": {"clientSecretSettingName": "microsoft-provider-authentication-secret"}}}})
+        protected = {"/": (302, sign_in), "/api/activity": (401, "")}
+        with_secret = json.dumps(["microsoft-provider-authentication-secret"])
         cases = [
-            ({"/": (302, sign_in), "/api/activity": (401, "")}, "pass"),
-            ({"/": (200, ""), "/api/activity": (200, "")}, "fail"),  # auth off
-            ({"/": (302, "https://login.microsoftonline.com/other-tenant/oauth2"), "/api/activity": (401, "")}, "fail"),
-            ({"/": (302, sign_in), "/api/activity": (200, "")}, "fail"),  # API excluded from auth
+            (protected, with_secret, "pass"),
+            ({"/": (200, ""), "/api/activity": (200, "")}, with_secret, "fail"),  # auth off
+            ({"/": (302, "https://login.microsoftonline.com/other-tenant/oauth2"), "/api/activity": (401, "")}, with_secret, "fail"),
+            ({"/": (302, sign_in), "/api/activity": (200, "")}, with_secret, "fail"),  # API excluded from auth
+            (protected, json.dumps([]), "fail"),  # redirect works but callbacks cannot redeem the code
         ]
-        for responses, expected in cases:
-            with self.subTest(responses=responses), patch(
+        for responses, secrets, expected in cases:
+            def az_run(args, secrets=secrets):
+                if "list" in args and "secret" not in args:
+                    return _AzResult(_CARDIOLOGY_APP_LIST)
+                return _AzResult(auth if "auth" in args else secrets)
+
+            with self.subTest(responses=responses, secrets=secrets), patch(
                 "shared.deployment_validation._unauthenticated_response",
                 side_effect=lambda fqdn, path, browser, r=responses: r[path],
             ):
-                result = cardiology_sign_in_check(config, lambda args: _AzResult(_CARDIOLOGY_APP_LIST))
+                result = cardiology_sign_in_check(config, az_run)
                 self.assertEqual(result["status"], expected, result["detail"])
 
 

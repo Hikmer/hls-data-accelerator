@@ -52,21 +52,26 @@ function Get-Output {
 }
 
 function Deploy-Template {
-    param ([string]$Image, [bool]$UseRegistry, [string]$Revision, [string]$PrincipalId)
+    param ([string]$Image, [bool]$UseRegistry, [string]$Revision, [string]$PrincipalId, [string]$AuthSecret = "")
     $paramsFile = New-TemporaryFile
     try {
+        & chmod 600 $paramsFile  # may hold the sign-in client secret
+        $parameters = @{
+            prefix = @{ value = $Prefix }
+            location = @{ value = $Location }
+            principalId = @{ value = $PrincipalId }
+            containerImage = @{ value = $Image }
+            useRegistryImage = @{ value = $UseRegistry }
+            revision = @{ value = $Revision }
+            tags = @{ value = $Tags }
+        }
+        # A container app deployment replaces its whole secret set; pass the
+        # sign-in secret back so an authenticated app keeps working.
+        if ($AuthSecret) { $parameters.authClientSecret = @{ value = $AuthSecret } }
         @{
             '$schema' = "https://schema.management.azure.com/schemas/2019-04-01/deploymentParameters.json#"
             contentVersion = "1.0.0.0"
-            parameters = @{
-                prefix = @{ value = $Prefix }
-                location = @{ value = $Location }
-                principalId = @{ value = $PrincipalId }
-                containerImage = @{ value = $Image }
-                useRegistryImage = @{ value = $UseRegistry }
-                revision = @{ value = $Revision }
-                tags = @{ value = $Tags }
-            }
+            parameters = $parameters
         } | ConvertTo-Json -Depth 10 | Set-Content -Path $paramsFile -Encoding utf8
         $name = "cardiology-app-$(Get-Date -Format 'yyyyMMddHHmmss')"
         $result = Invoke-Az @("deployment", "group", "create", "-g", $ResourceGroupName, "-n", $name,
@@ -219,15 +224,14 @@ $verified = @(Get-AppAssignments | ForEach-Object { $_ } | ForEach-Object { $_.p
 if (($verified -join ",") -ne (@($allowed | Sort-Object) -join ",")) { throw "App assignments do not match the requested sign-in accounts." }
 Write-Host "  ✓ Sign-in limited to $($verified.Count) assigned account(s)" -ForegroundColor Green
 
-# A fresh secret each deploy; it is handed straight to Container Apps and never printed.
+# A fresh secret each deploy; handed to Container Apps (and back to the template
+# for the revision deploy), never printed, cleared when the script ends.
 $secret = (Invoke-Az @("ad", "app", "credential", "reset", "--id", $appId, "--display-name", "container-apps-auth",
     "--years", "1", "--query", "password", "-o", "tsv")).Out.Trim()
-try {
-    Invoke-Az @("containerapp", "auth", "microsoft", "update", "-g", $ResourceGroupName, "-n", $appName,
-        "--client-id", $appId, "--client-secret", $secret,
-        # The v2 issuer names the tenant; the CLI rejects --tenant-id alongside it.
-        "--issuer", "https://login.microsoftonline.com/$ExpectedTenantId/v2.0", "--yes", "-o", "none") | Out-Null
-} finally { $secret = $null }
+Invoke-Az @("containerapp", "auth", "microsoft", "update", "-g", $ResourceGroupName, "-n", $appName,
+    "--client-id", $appId, "--client-secret", $secret,
+    # The v2 issuer names the tenant; the CLI rejects --tenant-id alongside it.
+    "--issuer", "https://login.microsoftonline.com/$ExpectedTenantId/v2.0", "--yes", "-o", "none") | Out-Null
 Invoke-Az @("containerapp", "auth", "update", "-g", $ResourceGroupName, "-n", $appName, "--enabled", "true",
     "--unauthenticated-client-action", "RedirectToLoginPage", "--redirect-provider", "azureactivedirectory",
     "--excluded-paths", "/api/health", "-o", "none") | Out-Null
@@ -252,15 +256,24 @@ function Test-SignInEnforced {
     } catch { return "sign-in probe: $($_.Exception.Message)" }
 }
 
-try {
-    # Control plane first: the auth config itself must be enforcing, for this
-    # app registration, with only /api/health anonymous.
+# Control plane: auth is enforcing for this registration, only /api/health is
+# anonymous, and the client secret it references exists (without it the redirect
+# works but every sign-in callback fails).
+function Test-AuthConfig {
     $cfg = (Invoke-Az @("containerapp", "auth", "show", "-g", $ResourceGroupName, "-n", $appName, "-o", "json")).Out | ConvertFrom-Json
+    $registration = $cfg.identityProviders.azureActiveDirectory.registration
     $excluded = @($cfg.globalValidation.excludedPaths) -join ","
-    if (-not ($cfg.platform.enabled -eq $true -and $cfg.globalValidation.unauthenticatedClientAction -eq "RedirectToLoginPage" -and
-              $cfg.identityProviders.azureActiveDirectory.registration.clientId -eq $appId -and $excluded -eq "/api/health")) {
-        throw "Container Apps auth is not enforcing sign-in for $appId (excluded paths: '$excluded'); the app image was not published."
-    }
+    $secretNames = @((Invoke-Az @("containerapp", "secret", "list", "-g", $ResourceGroupName, "-n", $appName, "--query", "[].name", "-o", "tsv")).Out -split "`n")
+    if (-not ($cfg.platform.enabled -eq $true -and $cfg.globalValidation.unauthenticatedClientAction -eq "RedirectToLoginPage")) { return "auth is not redirecting unauthenticated visitors" }
+    if ($registration.clientId -ne $appId) { return "auth uses client $($registration.clientId), expected $appId" }
+    if ($excluded -ne "/api/health") { return "unexpected anonymous paths '$excluded'" }
+    if ($secretNames -notcontains $registration.clientSecretSettingName) { return "client secret '$($registration.clientSecretSettingName)' is missing from the app" }
+    return ""
+}
+
+try {
+    $problem = Test-AuthConfig
+    if ($problem) { throw "Container Apps sign-in is not correctly configured ($problem); the app image was not published." }
     # Then the live edge, unless quarantined (no active revision answers).
     if (-not $quarantined) {
         $deadline = (Get-Date).AddMinutes(5)
@@ -286,7 +299,7 @@ if ($builtTags.Code -eq 0 -and ($builtTags.Out -split "`n") -contains $tag) {
     $loginServer = (Invoke-Az @("acr", "show", "-n", $acrName, "--query", "loginServer", "-o", "tsv")).Out.Trim()
     for ($attempt = 1; $attempt -le 3; $attempt++) {
         try {
-            Deploy-Template -Image "$loginServer/${ImageRepo}:$tag" -UseRegistry $true -Revision $tag -PrincipalId $deployerId | Out-Null
+            Deploy-Template -Image "$loginServer/${ImageRepo}:$tag" -UseRegistry $true -Revision $tag -PrincipalId $deployerId -AuthSecret $secret | Out-Null
             break
         } catch {
             if ($attempt -eq 3) { throw }
@@ -308,7 +321,9 @@ if ($builtTags.Code -eq 0 -and ($builtTags.Out -split "`n") -contains $tag) {
         if (-not ($healthOk -and -not $problem)) { Start-Sleep -Seconds 10 }
     }
     if (-not $healthOk -or $problem) { throw "Cardiology app did not become ready at $appUrl within 5 minutes: $problem" }
-} finally { $browser.Dispose() }
+    $problem = Test-AuthConfig
+    if ($problem) { throw "Sign-in configuration broke during the revision deploy: $problem" }
+} finally { $browser.Dispose(); $secret = $null }
 
 Write-Host "  ✓ $appUrl healthy on revision $tag; unauthenticated visitors are sent to sign-in" -ForegroundColor Green
 Write-Host ""
