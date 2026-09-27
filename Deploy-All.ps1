@@ -33,6 +33,7 @@
 #   .\Deploy-All.ps1 -Phase2                                          # Run Phase 2 only after HDS source deployment
 #   .\Deploy-All.ps1 -Phase3                                          # Run Phase 3 only (imaging toolkit)
 #   .\Deploy-All.ps1 -Phase4 -AlertEmail "nurse@hospital.com"          # Run Phase 4 only (ontology + activator)
+#   .\Deploy-All.ps1 -Phase8                                          # Run Phase 8 only (cardiology app on Container Apps)
 #   .\Deploy-All.ps1 -RebuildContainers                                # Force ACR image rebuilds
 
 param (
@@ -71,6 +72,8 @@ param (
     [switch]$Phase5,             # Run only Phase 5 (CMS Quality & Claims)
     [switch]$Phase7,                 # Run only Phase 7 (Payer RTI & Ops)
     [switch]$SkipPhase7,             # Skip Payer RTI & Ops entirely
+    [switch]$Phase8,                 # Run only Phase 8 (Cardiology App); no Fabric or Az PowerShell dependency
+    [switch]$SkipCardiologyApp,      # Skip the Cardiology App in a full deploy
     [switch]$SkipPayerRti,           # Skip claim-stream, payer KQL, claim emulator, Eventstream extension
     [switch]$SkipPayerActivator,     # Skip PayerOpsActivator Reflex
     [switch]$SkipOpsAgent,           # Skip HealthcareOpsAgent + Payer Ops Triage
@@ -103,6 +106,10 @@ param (
     # ── Phase 3 (FabricDicomCohortingToolkit) ──
     [string]$DicomToolkitPath = "C:\git\FabricDicomCohortingToolkit",
     [string]$DicomViewerResourceGroup = "rg-hds-dicom-viewer",
+
+    # ── Phase 8 (Cardiology App) ──
+    [string]$CardiologyAppPath = "",       # Local checkout of kfprugger/caldova-cardio-e2e; empty = sibling of this repo (cloned if missing)
+    [string[]]$CardiologyAppUsers = @(),   # Extra UPNs allowed to sign in; the deploying az user is always allowed
 
     # ── Phase 4 (Activator) ──
     [string]$AlertEmail = "",               # Email for clinical alert notifications (e.g. joey@brakeat.com)
@@ -140,8 +147,8 @@ $normalizedTags = @{}
 foreach ($entry in $Tags.GetEnumerator()) { $normalizedTags[$entry.Key] = $entry.Value }
 $normalizedTags["SecurityControl"] = "Ignore"
 $Tags = $normalizedTags
-$requestedSummaryTitle = if ($Phase7) { "PHASE 7 DEPLOYMENT SUMMARY" } elseif ($Phase5) { "PHASE 5 DEPLOYMENT SUMMARY" } elseif ($Phase4) { "PHASE 4 DEPLOYMENT SUMMARY" } elseif ($Phase3) { "PHASE 3 DEPLOYMENT SUMMARY" } elseif ($Phase2) { "PHASE 2 DEPLOYMENT SUMMARY" } else { "FULL DEPLOYMENT SUMMARY" }
-$requestedSummaryPhase = if ($Phase7) { "Phase7" } elseif ($Phase5) { "Phase5" } elseif ($Phase4) { "Phase4" } elseif ($Phase3) { "Phase3" } elseif ($Phase2) { "Phase2" } else { "Phase1+2+3+4+5+6+7" }
+$requestedSummaryTitle = if ($Phase8) { "PHASE 8 DEPLOYMENT SUMMARY" } elseif ($Phase7) { "PHASE 7 DEPLOYMENT SUMMARY" } elseif ($Phase5) { "PHASE 5 DEPLOYMENT SUMMARY" } elseif ($Phase4) { "PHASE 4 DEPLOYMENT SUMMARY" } elseif ($Phase3) { "PHASE 3 DEPLOYMENT SUMMARY" } elseif ($Phase2) { "PHASE 2 DEPLOYMENT SUMMARY" } else { "FULL DEPLOYMENT SUMMARY" }
+$requestedSummaryPhase = if ($Phase8) { "Phase8" } elseif ($Phase7) { "Phase7" } elseif ($Phase5) { "Phase5" } elseif ($Phase4) { "Phase4" } elseif ($Phase3) { "Phase3" } elseif ($Phase2) { "Phase2" } else { "Phase1+2+3+4+5+6+7+8" }
 
 # Prevent interactive `az` extension-install prompts from hanging the orchestrator.
 # The orchestrator launches pwsh with -NonInteractive; any extension prompt would hang forever.
@@ -197,8 +204,8 @@ function Resolve-SelectedFabricCapacity {
 }
 
 # Validate conditionally-required parameters
-if (-not $Teardown -and -not $Phase2 -and -not $Phase3 -and -not $Phase4 -and -not $Phase5 -and -not $Phase7 -and -not $AdminSecurityGroup) {
-    throw "Parameter '-AdminSecurityGroup' is required for deployment. Only -Teardown, -Phase2, -Phase3, -Phase4, -Phase5, and -Phase7 can omit it."
+if (-not $Teardown -and -not $Phase2 -and -not $Phase3 -and -not $Phase4 -and -not $Phase5 -and -not $Phase7 -and -not $Phase8 -and -not $AdminSecurityGroup) {
+    throw "Parameter '-AdminSecurityGroup' is required for deployment. Only -Teardown, -Phase2, -Phase3, -Phase4, -Phase5, -Phase7, and -Phase8 can omit it."
 }
 
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
@@ -297,6 +304,8 @@ if ($ReseedData) {
     $SkipHdsPipelines = $false
 }
 if ($Phase4 -or $Phase5) { $SkipPhase7 = $true }
+# Other phase-only modes never deploy the cardiology app.
+if ($Phase2 -or $Phase3 -or $Phase4 -or $Phase5 -or $Phase7) { $SkipCardiologyApp = $true }
 if ($SkipFabric) {
     $SkipRtiPhase2 = $true
     $SkipActivator = $true
@@ -603,15 +612,16 @@ function Test-Prerequisites {
 }
 
 if (-not $Teardown -and -not [string]::IsNullOrWhiteSpace($ExpectedSubscriptionId)) {
-    Set-AzContext -SubscriptionId $ExpectedSubscriptionId -ErrorAction Stop | Out-Null
+    # Phase 8 uses only the Azure CLI, so it does not require the Az PowerShell modules.
+    if (-not $Phase8) { Set-AzContext -SubscriptionId $ExpectedSubscriptionId -ErrorAction Stop | Out-Null }
     az account set --subscription $ExpectedSubscriptionId --only-show-errors
     if ($LASTEXITCODE -ne 0) {
         throw "Azure CLI could not select expected subscription $ExpectedSubscriptionId before preflight."
     }
 }
 
-# Run preflight checks (skip for teardown)
-if (-not $Teardown) {
+# Run preflight checks (skip for teardown; Phase 8 verifies its own tenant, subscription, and source)
+if (-not $Teardown -and -not $Phase8) {
     Test-Prerequisites
 
     if (-not $SkipHdsPipelines -and -not $SkipHdsSource) {
@@ -1290,6 +1300,23 @@ UNION ALL SELECT 'PatientReporting', COUNT(*) FROM dbo.PatientReporting
     Write-Host ""
 }
 
+function Invoke-CardiologyAppPhase {
+    Emit-PhaseTransition -Phase 8 -Label "Cardiology App" -StepCount 1
+    Invoke-Step -StepName "Phase 8: Cardiology App" `
+        -Description "Build the cardiology app image, deploy it to Container Apps, and put Entra sign-in in front of it" -Action {
+        $global:LASTEXITCODE = 0
+        & "$ScriptDir/phase-8/deploy-cardiology-app.ps1" `
+            -ResourceGroupName $ResourceGroupName `
+            -Location $Location `
+            -Tags $Tags `
+            -ExpectedTenantId $ExpectedTenantId `
+            -ExpectedSubscriptionId $ExpectedSubscriptionId `
+            -CardiologyAppPath $CardiologyAppPath `
+            -CardiologyAppUsers $CardiologyAppUsers
+        Assert-LastExternalCommandSucceeded "deploy-cardiology-app.ps1"
+    }
+}
+
 # ============================================================================
 # BANNER
 # ============================================================================
@@ -1314,6 +1341,8 @@ if ($Teardown) {
     Write-Host "  MODE: Phase 4 only (Ontology + Agent binding + Data Activator)" -ForegroundColor Blue
 } elseif ($Phase5) {
     Write-Host "  MODE: Phase 5 only (CMS Quality & Claims)" -ForegroundColor DarkYellow
+} elseif ($Phase8) {
+    Write-Host "  MODE: Phase 8 only (Cardiology App)" -ForegroundColor Cyan
 } elseif ($Phase7) {
     Write-Host "  MODE: Phase 7 only (Payer RTI & Ops)" -ForegroundColor Cyan
 } else {
@@ -1324,6 +1353,7 @@ if ($Teardown) {
     if ($SkipFabric) { $skips += "Fabric" }
     if ($ReuseFabricRti) { $skips += "Fabric RTI deploy (reusing live resources)" }
     if ($SkipPhase7) { $skips += "Payer RTI & Ops" }
+    if ($SkipCardiologyApp) { $skips += "Cardiology App" }
     if ($skips.Count -gt 0) {
         Write-Host "  SKIPPING: $($skips -join ', ')" -ForegroundColor Yellow
     } else {
@@ -1351,6 +1381,21 @@ if ($Teardown) {
     }
 
     Write-Summary -PhaseName "Teardown"
+    Pop-Location
+    exit 0
+}
+
+# ============================================================================
+# PHASE 8 ONLY MODE — Cardiology App (Azure CLI only; no Fabric)
+# ============================================================================
+
+if ($Phase8) {
+    Write-Host "  >>  Skipping Phase 1-7 (-Phase8)" -ForegroundColor DarkGray
+    Invoke-CardiologyAppPhase
+    Write-Summary -Title $requestedSummaryTitle -PhaseName $requestedSummaryPhase -PhaseResources @{
+        ResourceGroupName = $ResourceGroupName
+        Location          = $Location
+    }
     Pop-Location
     exit 0
 }
@@ -4087,6 +4132,10 @@ if ((-not $SkipPhase7 -and -not $Teardown) -or $Phase7) {
             Assert-LastExternalCommandSucceeded "deploy-payer-rti.ps1"
         }
     }
+}
+
+if (-not $SkipCardiologyApp -and -not $Teardown) {
+    Invoke-CardiologyAppPhase
 }
 
 if (-not $Teardown) {
