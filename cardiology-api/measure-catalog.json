@@ -1,12 +1,16 @@
 {
-  "$comment": "Single source of truth for cardiology measures shared by the HLS cardiology read API and the caldova-cardio-e2e agent platform. Keys match the platform scorer's MeasureSpec.key. Codes identify what is measured; units are UCUM. maxAgeSeconds decides when a value is reported stale. SYNTHETIC DATA ONLY.",
-  "version": "1.0.0",
+  "$comment": "Single source of truth for cardiology measures shared by the HLS cardiology read API and the caldova-cardio-e2e agent platform. Keys match the platform scorer's MeasureSpec.key. Codes identify what is measured; units are UCUM. `source` names the system a displayed value comes from: fhir-observation and cardiac-device-telemetry values reach the app through FHIR -> bronze -> silver -> reporting gold; masimo-telemetry values come from the Masimo pulse-oximeter stream in the Eventhouse (TelemetryRaw, `telemetryField`), and the estate's masimo-fhir-aggregator records a 5-minute mean per device in FHIR (effectivePeriod, Observation.device), which then reaches reporting gold like any other Observation. maxAgeSeconds decides when a value is reported stale. SYNTHETIC DATA ONLY.",
+  "version": "2.0.0",
   "localSystem": "https://brakekat.com/hls/cardiology/measures",
   "measures": [
     {
       "key": "lactate",
       "label": "Lactate",
-      "code": { "system": "http://loinc.org", "code": "2524-7", "display": "Lactate [Moles/volume] in Serum or Plasma" },
+      "code": {
+        "system": "http://loinc.org",
+        "code": "2524-7",
+        "display": "Lactate [Moles/volume] in Serum or Plasma"
+      },
       "unit": "mmol/L",
       "source": "fhir-observation",
       "maxAgeSeconds": 86400
@@ -14,33 +18,51 @@
     {
       "key": "map",
       "label": "Mean arterial pressure",
-      "code": { "system": "http://loinc.org", "code": "8478-0", "display": "Mean blood pressure" },
+      "code": {
+        "system": "http://loinc.org",
+        "code": "8478-0",
+        "display": "Mean blood pressure"
+      },
       "unit": "mm[Hg]",
       "source": "fhir-observation",
       "maxAgeSeconds": 86400
     },
     {
-      "key": "heartRate",
-      "label": "Heart rate",
-      "code": { "system": "http://loinc.org", "code": "8867-4", "display": "Heart rate" },
+      "key": "pulseRate",
+      "label": "Pulse rate",
+      "code": {
+        "system": "http://loinc.org",
+        "code": "8889-8",
+        "display": "Heart rate by Pulse oximetry"
+      },
       "unit": "/min",
-      "source": "fhir-observation",
-      "maxAgeSeconds": 86400,
-      "notes": "Not interchangeable with Heart rate by Pulse oximetry (LOINC 8889-8) from the Masimo stream; the API never substitutes one for the other."
+      "source": "masimo-telemetry",
+      "telemetryField": "pr",
+      "maxAgeSeconds": 300,
+      "notes": "From the patient's associated Masimo Radius-7 (FHIR Basic device-assoc). Pulse-oximetry pulse rate, not ECG heart rate (LOINC 8867-4); the estate has no ECG monitor feed, so no heart-rate measure is catalogued."
     },
     {
       "key": "spo2",
       "label": "Oxygen saturation",
-      "code": { "system": "http://loinc.org", "code": "2708-6", "display": "Oxygen saturation in Arterial blood" },
+      "code": {
+        "system": "http://loinc.org",
+        "code": "59408-5",
+        "display": "Oxygen saturation in Arterial blood by Pulse oximetry"
+      },
       "unit": "%",
-      "source": "fhir-observation",
-      "maxAgeSeconds": 86400,
-      "notes": "Same code the HLS canonical Synthea fixture already emits."
+      "source": "masimo-telemetry",
+      "telemetryField": "spo2",
+      "maxAgeSeconds": 300,
+      "notes": "From the patient's associated Masimo Radius-7. Pulse-oximetry SpO2 (59408-5), not arterial blood-gas saturation (2708-6)."
     },
     {
       "key": "deviceFlow",
       "label": "Device flow index",
-      "code": { "system": "https://brakekat.com/hls/cardiology/measures", "code": "device-flow-index", "display": "Synthetic cardiac-device flow index" },
+      "code": {
+        "system": "https://brakekat.com/hls/cardiology/measures",
+        "code": "device-flow-index",
+        "display": "Synthetic cardiac-device flow index"
+      },
       "unit": "%",
       "source": "cardiac-device-telemetry",
       "maxAgeSeconds": 900,

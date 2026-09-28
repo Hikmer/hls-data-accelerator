@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: HLS Cardiology Read API
-  version: 1.0.0
+  version: 2.0.0
   license:
     name: MIT
     identifier: MIT
@@ -17,6 +17,11 @@ info:
         projections of FHIR Patient / Condition / Observation.
       - Device association: FHIR Device + DeviceAssociation (HDS Silver).
       - Device windows: Eventhouse (synthetic cardiac-device feed).
+      - Pulse rate and SpO2 (Masimo pulse oximetry): the live reading is the
+        latest Eventhouse TelemetryRaw row for the subject's associated Masimo
+        device (FHIR Basic device-assoc); one reading per charting interval is
+        charted into FHIR as an Observation with Observation.device set, and
+        reaches reporting Gold through the normal FHIR path.
       - Metrics: reporting Gold, one governed definition per metric.
 
     Identifiers: subjectId is the FHIR Patient logical id; deviceId is the
@@ -222,7 +227,7 @@ components:
     MeasureKey:
       type: string
       description: Key from measure-catalog.json; equals the platform scorer's MeasureSpec.key.
-      enum: [lactate, map, heartRate, spo2, deviceFlow]
+      enum: [lactate, map, pulseRate, spo2, deviceFlow]
     Coding:
       type: object
       required: [system, code]
@@ -274,16 +279,16 @@ components:
           required: [system, code]
           properties: { system: { const: "http://loinc.org" }, code: { const: "8478-0" }, display: { type: string } }
         unit: { const: "mm[Hg]" }
-    HeartRateObservation:
+    PulseRateObservation:
       allOf: [{ $ref: "#/components/schemas/ObservationBase" }]
       type: object
       required: [measure, code, unit]
       properties:
-        measure: { const: heartRate }
+        measure: { const: pulseRate }
         code:
           type: object
           required: [system, code]
-          properties: { system: { const: "http://loinc.org" }, code: { const: "8867-4" }, display: { type: string } }
+          properties: { system: { const: "http://loinc.org" }, code: { const: "8889-8" }, display: { type: string } }
         unit: { const: /min }
     Spo2Observation:
       allOf: [{ $ref: "#/components/schemas/ObservationBase" }]
@@ -294,7 +299,7 @@ components:
         code:
           type: object
           required: [system, code]
-          properties: { system: { const: "http://loinc.org" }, code: { const: "2708-6" }, display: { type: string } }
+          properties: { system: { const: "http://loinc.org" }, code: { const: "59408-5" }, display: { type: string } }
         unit: { const: "%" }
     DeviceFlowObservation:
       allOf: [{ $ref: "#/components/schemas/ObservationBase" }]
@@ -311,7 +316,7 @@ components:
       oneOf:
         - $ref: "#/components/schemas/LactateObservation"
         - $ref: "#/components/schemas/MapObservation"
-        - $ref: "#/components/schemas/HeartRateObservation"
+        - $ref: "#/components/schemas/PulseRateObservation"
         - $ref: "#/components/schemas/Spo2Observation"
         - $ref: "#/components/schemas/DeviceFlowObservation"
     MissingMeasure:
@@ -331,9 +336,9 @@ components:
       oneOf:
         - { type: object, required: [status, observation, stale], properties: { status: { const: present }, observation: { $ref: "#/components/schemas/MapObservation" }, stale: { $ref: "#/components/schemas/Staleness" } } }
         - $ref: "#/components/schemas/MissingMeasure"
-    LatestHeartRate:
+    LatestPulseRate:
       oneOf:
-        - { type: object, required: [status, observation, stale], properties: { status: { const: present }, observation: { $ref: "#/components/schemas/HeartRateObservation" }, stale: { $ref: "#/components/schemas/Staleness" } } }
+        - { type: object, required: [status, observation, stale], properties: { status: { const: present }, observation: { $ref: "#/components/schemas/PulseRateObservation" }, stale: { $ref: "#/components/schemas/Staleness" } } }
         - $ref: "#/components/schemas/MissingMeasure"
     LatestSpo2:
       oneOf:
@@ -367,6 +372,8 @@ components:
           device           = device ? { kind: device.kind, serial: device.serial } : undefined
           attendingRole    = attendingRole            (may be null)
           observations[k]  = latest[k].observation.value when status=present and stale=false, else null
+                             (pulseRate and spo2: latest[k] is the later of the Eventhouse live
+                             reading and the latest FHIR-charted copy, by effectiveAt)
           observedAt       = observedAt               (may be null)
         CohortRecord.attendingRole and observedAt are non-null strings today; the
         platform read adapter must widen both to string | null rather than
@@ -402,11 +409,11 @@ components:
         latest:
           type: object
           description: One entry per catalog measure key, each bound to that measure's code and unit.
-          required: [lactate, map, heartRate, spo2, deviceFlow]
+          required: [lactate, map, pulseRate, spo2, deviceFlow]
           properties:
             lactate: { $ref: "#/components/schemas/LatestLactate" }
             map: { $ref: "#/components/schemas/LatestMap" }
-            heartRate: { $ref: "#/components/schemas/LatestHeartRate" }
+            pulseRate: { $ref: "#/components/schemas/LatestPulseRate" }
             spo2: { $ref: "#/components/schemas/LatestSpo2" }
             deviceFlow: { $ref: "#/components/schemas/LatestDeviceFlow" }
           additionalProperties: false
