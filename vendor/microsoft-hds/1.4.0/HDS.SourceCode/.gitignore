@@ -342,6 +342,14 @@ coveragetool
 reports/
 *.cobertura.xml
 
+# The generic "reports/" rule above matches case-insensitively on Windows/macOS
+# and was dropping Microsoft's Power BI "Reports" build artifacts under
+# hds-build-artifacts (care-management-analytics, patient-outreach-analytics-advanced).
+# Those flattened Reports payloads are required by the HDS source validator and
+# powerbi_deployer, so re-include them explicitly.
+!hds-build-artifacts/**/Reports/
+!hds-build-artifacts/**/Reports/**
+
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
