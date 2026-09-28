@@ -3,7 +3,7 @@
     python3 refresh_cardiology_gold.py [--since ISO8601] [--skip-export] [--skip-ingest] [--skip-gold]
 
 Runs the estate's standard path end to end:
-  1. FHIR bulk $export of the cardiology resource types changed since the
+  1. FHIR bulk $export of the resource types the gold projection reads, changed since the
      watermark, into the service's configured `fhir-export` container. That
      container is the bronze lakehouse shortcut
      Files/Ingest/Clinical/FHIR-NDJSON/FHIR-HDS.
@@ -13,8 +13,9 @@ Runs the estate's standard path end to end:
   4. A metadata sync of the gold SQL analytics endpoint. Without it, SQL
      readers (the app) keep seeing the previous table version for minutes.
 
-Watermark (when --since is omitted): the newest meta.lastUpdated among tagged
-resources already in silver, minus a 5-minute overlap. If silver has none yet,
+Watermark (when --since is omitted): the newest meta.lastUpdated across all silver
+rows of those types (tagged or not: Patient and Basic device-assoc are untagged),
+minus a 5-minute overlap. If silver has none yet,
 the oldest tagged resource in FHIR. An overlap only re-exports rows that silver
 upserts by id, so it never duplicates.
 
@@ -39,7 +40,8 @@ WORKSPACE_ID = "f8f84d68-cfa1-4460-95d1-943fac43248a"
 INGEST_PIPELINE_ID = "7a1cb1a4-fe5d-4f8d-a7eb-43c422ce087d"  # healthcare1_msft_clinical_data_foundation_ingestion
 GOLD_NOTEBOOK_NAME = "cardiology_gold_projection"
 TAG = "https://brakekat.com/hls/tags|synthetic-caldova-cardiology"
-TYPES = ["Encounter", "Condition", "CareTeam", "Device", "DeviceUseStatement", "Observation"]
+# Every silver type the gold projection reads (Patient and the Masimo Basic device-assoc links are untagged).
+TYPES = ["Patient", "Basic", "Encounter", "Condition", "CareTeam", "Device", "DeviceUseStatement", "Observation"]
 SQL_HOST = "nkhahdl5to4ezo6p5bg76flepa-nbg7r6fbz5qejforsq72yqzeri.datawarehouse.fabric.microsoft.com"
 FABRIC = "https://api.fabric.microsoft.com/v1"
 GOLD_SQL_ENDPOINT_ID = "6b0f4a14-0959-4fa5-9cde-efedfff11bae"  # healthcare1_reporting_gold
@@ -65,7 +67,7 @@ def http(method: str, url: str, tok: str, body: dict | None = None, headers: dic
 
 
 def silver_watermark() -> dt.datetime | None:
-    """Newest meta.lastUpdated of tagged resources in silver, via the SQL endpoint."""
+    """Newest meta.lastUpdated across all silver rows of TYPES (no tag filter), via the SQL endpoint."""
     try:
         import mssql_python  # noqa: PLC0415 - optional; only the watermark needs it
     except ImportError:
@@ -75,9 +77,7 @@ def silver_watermark() -> dt.datetime | None:
     conn = mssql_python.connect(f"Server={SQL_HOST},1433;Database=healthcare1_msft_silver;Encrypt=yes;",
                                 attrs_before={1256: struct.pack("<i", len(tb)) + tb})
     cur = conn.cursor()
-    unions = " UNION ALL ".join(
-        f"SELECT MAX(meta_lastUpdated) m FROM dbo.[{t}] WHERE meta_string LIKE '%synthetic-caldova-cardiology%'"
-        for t in TYPES)
+    unions = " UNION ALL ".join(f"SELECT MAX(meta_lastUpdated) m FROM dbo.[{t}]" for t in TYPES)
     cur.execute(f"SELECT MAX(m) FROM ({unions}) u")
     row = cur.fetchone()
     conn.close()

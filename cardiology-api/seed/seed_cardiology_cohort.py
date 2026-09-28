@@ -8,13 +8,16 @@ DeviceUseStatement, and Observation series). No Patient resources are created. S
 Modes (every mode is a dry run unless --apply is given):
   (default)          plan the cohort and print counts plus one sample per resource type
   --apply            PUT every planned resource in FHIR batch Bundles, and retract retired measures
-  --remove           DELETE every resource carrying the cardiology tag
+  --remove           retract every resource carrying the cardiology tag (PUT, entered-in-error)
   --refresh          write one new observation slot at --as-of per enrolled subject
 
 Pulse rate and SpO2 come from the Masimo pulse-oximeter stream (measure catalog v2), so this script
 no longer generates them. --apply retracts every tagged Observation still carrying a retired code
 (LOINC 8867-4 heart rate, 2708-6 SpO2) by PUTting it back with status entered-in-error; the
 incremental FHIR export propagates that, where a DELETE would not. Already-retracted ones are skipped.
+--remove retracts the same export-visible way and never DELETEs: Encounter, CareTeam, Device,
+DeviceUseStatement and Observation get status entered-in-error; a Condition loses clinicalStatus and
+gets verificationStatus entered-in-error (condition-ver-status). The tag stays.
 
 Resource ids are deterministic (cal- + sha256(patientId|kind|slot)[:40]) and observation slots
 are keyed by their effective time, so rerunning --apply with the same --as-of changes nothing.
@@ -112,8 +115,9 @@ DECIMALS = {"lactate": 2, "map": 1, "deviceFlow": 1}
 # Codes the seed generated before measure catalog v2 (ECG heart rate, arterial blood-gas SpO2).
 RETIRED_CODES = [("http://loinc.org", "8867-4"), ("http://loinc.org", "2708-6")]
 RETRACTED_STATUS = "entered-in-error"
+CONDITION_VER_STATUS = "http://terminology.hl7.org/CodeSystem/condition-ver-status"
 
-# PUT order keeps referenced resources ahead of referrers; DELETE runs in reverse.
+# PUT order keeps referenced resources ahead of referrers.
 RESOURCE_TYPES = ["Encounter", "Condition", "CareTeam", "Device", "DeviceUseStatement", "Observation"]
 
 
@@ -353,7 +357,7 @@ class Fhir:
     def count(self, query: str) -> int:
         return int(self.request("GET", f"{query}&_summary=count")["total"])
 
-    def batch(self, entries: list[dict], allowed: tuple[int, ...] = ()) -> None:
+    def batch(self, entries: list[dict]) -> None:
         """Send entries in batch Bundles of at most BATCH_LIMIT; retry 429/5xx entries; fail on the rest."""
         for offset in range(0, len(entries), BATCH_LIMIT):
             pending = entries[offset:offset + BATCH_LIMIT]
@@ -367,7 +371,7 @@ class Fhir:
                 for sent, result in zip(pending, results):
                     status_text = result.get("response", {}).get("status", "")
                     status = int(status_text.split()[0]) if status_text[:3].isdigit() else 0
-                    if 200 <= status < 300 or status in allowed:
+                    if 200 <= status < 300:
                         continue
                     if status == 429 or status >= 500:
                         retry.append(sent)
@@ -426,9 +430,30 @@ def plan_retractions(fhir: Fhir) -> list[dict]:
     for obs in fhir.search(f"Observation?_tag={TAG_PARAM}&code={codes}&_count=1000"):
         if obs.get("resourceType") != "Observation" or obs.get("status") == RETRACTED_STATUS:
             continue
-        meta = {k: v for k, v in obs.get("meta", {}).items() if k not in ("versionId", "lastUpdated")}
-        retractions.append({**obs, "meta": meta, "status": RETRACTED_STATUS})
+        retractions.append({**obs, "meta": unversioned(obs.get("meta", {})), "status": RETRACTED_STATUS})
     return retractions
+
+
+def unversioned(meta: dict) -> dict:
+    """meta for a PUT back: the server assigns versionId and lastUpdated; the tag is kept."""
+    return {k: v for k, v in meta.items() if k not in ("versionId", "lastUpdated")}
+
+
+def retracted(resource: dict) -> dict | None:
+    """The export-visible retraction of a tagged resource, or None when it is already retracted."""
+    meta = unversioned(resource.get("meta", {}))
+    if resource["resourceType"] == "Condition":
+        verification = resource.get("verificationStatus", {}).get("coding", [])
+        if "clinicalStatus" not in resource and any(
+                c.get("system") == CONDITION_VER_STATUS and c.get("code") == RETRACTED_STATUS for c in verification):
+            return None
+        # FHIR R4 con-5: clinicalStatus SHALL NOT be present when verificationStatus is entered-in-error.
+        condition = {k: v for k, v in resource.items() if k != "clinicalStatus"}
+        return {**condition, "meta": meta,
+                "verificationStatus": concept(CONDITION_VER_STATUS, RETRACTED_STATUS, "Entered in Error")}
+    if resource.get("status") == RETRACTED_STATUS:
+        return None
+    return {**resource, "meta": meta, "status": RETRACTED_STATUS}
 
 
 def retired_code_counts(resources: list[dict]) -> dict[str, int]:
@@ -481,14 +506,22 @@ def run_seed(fhir: Fhir, catalog: dict, as_of: datetime, apply: bool) -> None:
 
 def run_remove(fhir: Fhir, apply: bool) -> None:
     targets = []
-    for resource_type in reversed(RESOURCE_TYPES):
-        ids = sorted(r["id"] for r in fhir.search(f"{resource_type}?_tag={TAG_PARAM}&_count=1000&_elements=id"))
-        print(f"{resource_type}: {len(ids)} tagged")
-        targets += [{"request": {"method": "DELETE", "url": f"{resource_type}/{i}"}} for i in ids]
+    for resource_type in RESOURCE_TYPES:
+        found = [r for r in fhir.search(f"{resource_type}?_tag={TAG_PARAM}&_count=1000")
+                 if r.get("resourceType") == resource_type]
+        pending = [r for r in map(retracted, found) if r is not None]
+        print(f"{resource_type}: {len(found)} tagged, {len(found) - len(pending)} already retracted, "
+              f"{len(pending)} to retract")
+        targets += pending
+    entries = put_entries(targets)
+    methods = sorted({e["request"]["method"] for e in entries})
+    print(f"planned retractions: {len(entries)} requests, methods {methods}")
     if not apply:
-        print(f"dry run: would DELETE {len(targets)} resources (pass --apply to delete)")
+        print_samples(targets)
+        print(f"dry run: would PUT {len(entries)} retractions (status -> {RETRACTED_STATUS}); "
+              "nothing is deleted (pass --apply to write)")
         return
-    fhir.batch(targets, allowed=(404,))
+    fhir.batch(entries)
     print("tagged counts now:", json.dumps(tagged_counts(fhir)))
 
 
@@ -554,7 +587,8 @@ def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--apply", action="store_true", help="write to FHIR (default is a dry run)")
     mode = parser.add_mutually_exclusive_group()
-    mode.add_argument("--remove", action="store_true", help="delete every tagged cardiology resource")
+    mode.add_argument("--remove", action="store_true",
+                      help="retract every tagged cardiology resource (PUT entered-in-error; never DELETE)")
     mode.add_argument("--refresh", action="store_true", help="write one new observation slot at --as-of")
     parser.add_argument("--as-of", help="series end time (ISO 8601, UTC if no offset); default now")
     parser.add_argument("--fhir-url", default=FHIR_URL, help="FHIR base URL (also the token audience)")

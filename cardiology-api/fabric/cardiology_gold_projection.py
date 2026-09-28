@@ -52,6 +52,9 @@ TAG_CODE = "synthetic-caldova-cardiology"
 ACT_CODE_SYSTEM = "http://terminology.hl7.org/CodeSystem/v3-ActCode"
 CARE_SETTINGS = {"IMP": "inpatient", "AMB": "outpatient", "HH": "home-monitored"}
 OBSERVATION_STATUSES = ["final", "amended", "corrected"]
+# Masimo device-assoc extension url suffixes, verbatim from masimo-fhir-aggregator/aggregator.py.
+DEVICE_EXTENSION_SUFFIXES = ("associated-device", "device-association-device")
+STATUS_EXTENSION_SUFFIXES = ("association-status", "device-association-status")
 
 # Must equal cardiology-api/measure-catalog.json (key, code system, code, unit, in catalog order).
 # deploy_gold_projection.py refuses to deploy when it does not.
@@ -65,7 +68,7 @@ MEASURE_CATALOG = [
 
 # Silver stores complex FHIR elements as JSON strings; references carry the target FHIR id at
 # $.identifier.value (HDS also keeps msftSourceReference "Type/<id>" and idOrig).
-REFERENCE_SCHEMA = "struct<identifier:struct<value:string>,idOrig:string,msftSourceReference:string>"
+REFERENCE_SCHEMA = "struct<type:string,identifier:struct<value:string>,idOrig:string,msftSourceReference:string>"
 META_TAG_SCHEMA = "struct<tag:array<struct<system:string,code:string>>>"
 CODEABLE_SCHEMA = "struct<coding:array<struct<system:string,code:string,display:string>>>"
 CODING_SCHEMA = "struct<system:string,code:string>"
@@ -73,6 +76,8 @@ PERIOD_SCHEMA = "struct<start:string,end:string>"
 QUANTITY_SCHEMA = "struct<value:double,unit:string,code:string>"
 NAME_SCHEMA = "array<struct<family:string,given:array<string>>>"
 PARTICIPANT_SCHEMA = "array<struct<role:array<struct<coding:array<struct<display:string>>>>>>"
+# Basic.extension is kept as the raw FHIR JSON array.
+EXTENSION_SCHEMA = "array<struct<url:string,valueCode:string,valueReference:struct<reference:string>>>"
 
 # Gold column order and types are the app contract; conform() is the only way rows reach a table.
 GOLD_SCHEMAS = {
@@ -90,7 +95,8 @@ GOLD_SCHEMAS = {
         ("refreshed_at", "timestamp"),
     ],
     "cardiology_enrollable_patient": [
-        ("patient_id", "string"), ("initials", "string"), ("age_band", "string"), ("refreshed_at", "timestamp"),
+        ("patient_id", "string"), ("initials", "string"), ("age_band", "string"), ("pulse_oximeter_device_id", "string"),
+        ("refreshed_at", "timestamp"),
     ],
 }
 GOLD_KEYS = {"cardiology_subject": "subject_id", "cardiology_observation": "observation_id", "cardiology_enrollable_patient": "patient_id"}
@@ -129,6 +135,18 @@ def ref_id(column):
         non_empty(F.regexp_replace(ref["msftSourceReference"], "^[A-Za-z]+/", "")),
         non_empty(ref["idOrig"]),
     )
+
+
+def ref_type(column):
+    ref = F.from_json(F.col(column), REFERENCE_SCHEMA)
+    return F.coalesce(non_empty(ref["type"]), non_empty(F.regexp_extract(ref["msftSourceReference"], "^([A-Za-z]+)/", 1)))
+
+
+def url_ends_with(url, suffixes):
+    matched = F.lit(False)
+    for suffix in suffixes:
+        matched = matched | url.endswith(suffix)
+    return matched
 
 
 def first_coding(column):
@@ -216,22 +234,43 @@ subject_device = (
     .select("subject_id", "device_id", "device_kind", "device_serial", "device_associated_since")
 )
 
-# ── Masimo pulse oximeter: Silver Basic device-assoc, read as gold DeviceAssociation reads it ──
-# (fabric-rti/sql/create-device-association-table.ipynb): code.coding[0].code = device-assoc and the
-# device id is extension[0].valueReference.reference without "Device/"; it equals the Eventhouse
-# TelemetryRaw device_id. These links are not cardiology-tagged.
-pulse_oximeter_links = (
-    latest_per(read_silver("Basic").filter(F.col("idOrig").isNotNull()), "idOrig", "meta_lastUpdated", "msftModifiedDatetime")
-    .filter(F.get_json_object(F.col("code_string"), "$.coding[0].code") == "device-assoc")
-    .select(
-        ref_id("subject_string").alias("subject_id"),
-        non_empty(F.regexp_replace(F.get_json_object(F.col("extension"), "$[0].valueReference.reference"), "^Device/", "")).alias("pulse_oximeter_device_id"),
-    )
-    .filter(F.col("subject_id").isNotNull() & F.col("pulse_oximeter_device_id").isNotNull())
+# ── Masimo pulse oximeter: active FHIR Basic device-assoc links ─────────────────────
+# The same rule as masimo-fhir-aggregator/aggregator.py parse_associations, so gold and the
+# aggregator agree on every device's patient: the latest version of each Basic with
+# code.coding[0].code = device-assoc; status and devices are found by extension url suffix
+# (an association whose status is present and not "active" is ignored); the subject must be
+# a Patient; a device linked to more than one patient is ambiguous and dropped for all of
+# them. The Device id equals the Eventhouse TelemetryRaw device_id. Not cardiology-tagged.
+association_extensions = F.from_json(F.col("extension"), EXTENSION_SCHEMA)
+association_status = F.filter(association_extensions, lambda e: url_ends_with(e["url"], STATUS_EXTENSION_SUFFIXES)).getItem(0)["valueCode"]
+associated_devices = F.transform(
+    F.filter(association_extensions, lambda e: url_ends_with(e["url"], DEVICE_EXTENSION_SUFFIXES)),
+    lambda e: e["valueReference"]["reference"],
 )
-subject_pulse_oximeter = pulse_oximeter_links.groupBy("subject_id").agg(
+device_assoc_links = (
+    latest_per(read_silver("Basic").filter(F.col("idOrig").isNotNull()), "idOrig", "meta_lastUpdated", "msftModifiedDatetime")
+    .filter(first_coding("code_string")["code"] == "device-assoc")
+    .filter(association_status.isNull() | (association_status == "active"))
+    .filter(ref_type("subject_string") == "Patient")
+    .select(ref_id("subject_string").alias("patient_id"), F.explode(associated_devices).alias("device_reference"))
+    .filter(F.col("patient_id").isNotNull() & F.col("device_reference").startswith("Device/") & (F.length("device_reference") > len("Device/")))
+    .select("patient_id", F.regexp_replace("device_reference", "^Device/", "").alias("pulse_oximeter_device_id"))
+    .distinct()
+)
+ambiguous_devices = (
+    device_assoc_links.groupBy("pulse_oximeter_device_id").agg(F.countDistinct("patient_id").alias("patient_count"))
+    .filter(F.col("patient_count") > 1).select("pulse_oximeter_device_id")
+)
+unambiguous_links = device_assoc_links.join(ambiguous_devices, "pulse_oximeter_device_id", "left_anti")
+patient_pulse_oximeter = unambiguous_links.groupBy("patient_id").agg(
     F.countDistinct("pulse_oximeter_device_id").alias("pulse_oximeter_count"),
     F.min("pulse_oximeter_device_id").alias("pulse_oximeter_device_id"),
+)
+print(
+    f"Masimo device-assoc: {device_assoc_links.count()} active Patient links; "
+    f"{ambiguous_devices.count()} ambiguous devices (linked to more than one patient) dropped for "
+    f"{device_assoc_links.join(ambiguous_devices, 'pulse_oximeter_device_id', 'left_semi').select('patient_id').distinct().count()} patients; "
+    f"{patient_pulse_oximeter.filter(F.col('pulse_oximeter_count') > 1).count()} patients linked to more than one device"
 )
 
 # ── Primary condition and attending role, both scoped to the enrollment Encounter ────
@@ -281,12 +320,12 @@ subject_candidates = (
     .join(conditions, ["subject_id", "encounter_id"], "left")
     .join(care_teams, ["subject_id", "encounter_id"], "left")
     .join(subject_device, "subject_id", "left")
-    .join(subject_pulse_oximeter, "subject_id", "left")
+    .join(patient_pulse_oximeter.withColumnRenamed("patient_id", "subject_id"), "subject_id", "left")
     .withColumn(
         "exclusion",
         F.when(F.col("encounter_count") > 1, "more than one in-progress tagged Encounter")
         .when(F.coalesce(F.col("device_count"), F.lit(0)) > 1, "more than one active tagged device")
-        .when(F.coalesce(F.col("pulse_oximeter_count"), F.lit(0)) > 1, "more than one Masimo device-assoc link")
+        .when(F.coalesce(F.col("pulse_oximeter_count"), F.lit(0)) > 1, "more than one Masimo device (active, unambiguous device-assoc)")
         .when(F.col("patient_id").isNull(), "Patient not in Silver")
         .when(F.col("care_setting").isNull(), "Encounter class not IMP/AMB/HH (v3-ActCode)")
         .when(F.col("encounter_start").isNull(), "Encounter period.start missing")
@@ -297,13 +336,15 @@ subject_candidates = (
 cardiology_subject = conform(report_exclusions("cardiology_subject", subject_candidates), "cardiology_subject")
 
 # ── cardiology_observation: every catalog-coded Observation for projected subjects ──
+# A row reaches gold only with a finite value, an effective time and the catalog unit
+# (UCUM code, falling back to unit); rejected rows are counted, never kept.
 measure_map = F.create_map(*[F.lit(v) for m in MEASURE_CATALOG for v in (f"{m['system']}|{m['code']}", m["key"])])
 catalog_unit_map = F.create_map(*[F.lit(v) for m in MEASURE_CATALOG for v in (m["key"], m["unit"])])
 measure_keys = [f"{m['system']}|{m['code']}" for m in MEASURE_CATALOG]
 codings = F.from_json(F.col("code_string"), CODEABLE_SCHEMA)["coding"]
 catalog_coding = F.filter(codings, lambda c: F.concat(c["system"], F.lit("|"), c["code"]).isin(measure_keys)).getItem(0)
 quantity = F.from_json(F.col("valueQuantity_string"), QUANTITY_SCHEMA)
-observations = conform(
+observation_candidates = (
     latest_per(read_silver("Observation").filter(F.col("idOrig").isNotNull()), "idOrig", "meta_lastUpdated", "msftModifiedDatetime")
     .filter(F.col("status").isin(OBSERVATION_STATUSES))
     .withColumn("_coding", catalog_coding)
@@ -317,7 +358,7 @@ observations = conform(
         F.col("_coding.system").alias("code_system"),
         F.col("_coding.code").alias("code"),
         quantity["value"].alias("value"),
-        F.coalesce(quantity["unit"], quantity["code"]).alias("unit"),
+        F.coalesce(quantity["code"], quantity["unit"]).alias("unit"),
         # Point-in-time readings carry effectiveDateTime/Instant; the Masimo 5-minute aggregates carry
         # effectivePeriod and are placed at the end of their window.
         F.coalesce(F.col("effectiveDateTime"), F.col("effectiveInstant"),
@@ -325,21 +366,23 @@ observations = conform(
         ref_id("device_string").alias("device_id"),
         F.col("meta_lastUpdated").alias("fhir_last_updated"),
         F.col("msftModifiedDatetime").alias("silver_modified_at"),
-    ),
-    "cardiology_observation",
+    )
+    .withColumn(
+        "exclusion",
+        F.when(F.col("value").isNull() | F.isnan("value") | (F.abs("value") == float("inf")), "valueQuantity.value missing or not finite")
+        .when(F.col("effective_at").isNull(), "no effectiveDateTime, effectiveInstant or effectivePeriod.end")
+        .when(F.col("unit").isNull() | (F.col("unit") != F.element_at(catalog_unit_map, F.col("measure"))), "unit differs from the catalog unit"),
+    )
 )
-observation_checks = observations.agg(
-    F.count("*").alias("rows"),
-    F.count(F.when(F.col("value").isNull(), 1)).alias("null_value"),
-    F.count(F.when(F.col("effective_at").isNull(), 1)).alias("null_effective_at"),
-    F.count(F.when(F.col("unit") != F.element_at(catalog_unit_map, F.col("measure")), 1)).alias("unit_differs_from_catalog"),
-).first()
-print(f"cardiology_observation checks (rows kept): {observation_checks.asDict()}")
+observations = conform(report_exclusions("cardiology_observation", observation_candidates), "cardiology_observation")
 
 # ── cardiology_enrollable_patient: alive and not enrolled ────────────────────────────
 enrollable_candidates = (
     patients.filter(F.col("alive"))
     .join(enrolled_ids.withColumnRenamed("subject_id", "patient_id"), "patient_id", "left_anti")
+    .join(patient_pulse_oximeter, "patient_id", "left")
+    # Only a patient's unique, unambiguous active Masimo device; otherwise NULL (not admissible).
+    .withColumn("pulse_oximeter_device_id", F.when(F.col("pulse_oximeter_count") == 1, F.col("pulse_oximeter_device_id")))
     .withColumn("exclusion", F.when(F.col("initials").isNull() | F.col("age_band").isNull(), "Patient name or birthDate missing"))
 )
 cardiology_enrollable_patient = conform(report_exclusions("cardiology_enrollable_patient", enrollable_candidates), "cardiology_enrollable_patient")

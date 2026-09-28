@@ -19,9 +19,14 @@ info:
       - Device windows: Eventhouse (synthetic cardiac-device feed).
       - Pulse rate and SpO2 (Masimo pulse oximetry): the live reading is the
         latest Eventhouse TelemetryRaw row for the subject's associated Masimo
-        device (FHIR Basic device-assoc); one reading per charting interval is
-        charted into FHIR as an Observation with Observation.device set, and
-        reaches reporting Gold through the normal FHIR path.
+        device (the active, unambiguous FHIR Basic device-assoc link). The
+        estate's masimo-fhir-aggregator writes every completed UTC 5-minute
+        window per device and measure into FHIR as one Observation: the mean
+        of the window's readings, tagged masimo-telemetry-aggregate
+        (https://brakekat.com/hls/tags), with effectivePeriod {start, end},
+        Observation.device and meta.source set. It reaches reporting Gold
+        through the normal FHIR $export path, where it is ordered by the end
+        of its window (effectiveAt = effectivePeriod.end).
       - Metrics: reporting Gold, one governed definition per metric.
 
     Identifiers: subjectId is the FHIR Patient logical id; deviceId is the
@@ -373,7 +378,8 @@ components:
           attendingRole    = attendingRole            (may be null)
           observations[k]  = latest[k].observation.value when status=present and stale=false, else null
                              (pulseRate and spo2: latest[k] is the later of the Eventhouse live
-                             reading and the latest FHIR-charted copy, by effectiveAt)
+                             reading and the latest 5-minute FHIR aggregate, by effectiveAt,
+                             which for an aggregate is its window end)
           observedAt       = observedAt               (may be null)
         CohortRecord.attendingRole and observedAt are non-null strings today; the
         platform read adapter must widen both to string | null rather than
