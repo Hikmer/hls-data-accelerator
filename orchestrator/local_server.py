@@ -650,8 +650,8 @@ class DeployRequest(BaseModel):
     admin_security_group: str = ""
     fabric_workspace_name: str = ""
 
-    expected_tenant_id: str = "8d038e6a-9b7d-4cb8-bbcf-e84dff156478"
-    expected_subscription_id: str = "9bbee190-dc61-4c58-ab47-1275cb04018f"
+    expected_tenant_id: str = "9bea5862-7310-4237-af4d-3e296ff96446"
+    expected_subscription_id: str = "7d045140-2d3f-4ac9-83ec-c4f2c0b0b143"
     @staticmethod
     def _check_name(v: str, info) -> str:
         return _validate_safe_name(v, info.field_name) if v else v

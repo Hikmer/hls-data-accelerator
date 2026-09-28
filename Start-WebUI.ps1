@@ -50,7 +50,7 @@ if (-not $env:AZURE_CONFIG_DIR -and (Test-Path $BrakeKatAzureConfig)) {
     $env:AZURE_CONFIG_DIR = $BrakeKatAzureConfig
 }
 if ($env:AZURE_CONFIG_DIR -eq $BrakeKatAzureConfig -and -not $env:AZURE_TENANT_ID) {
-    $env:AZURE_TENANT_ID = "8d038e6a-9b7d-4cb8-bbcf-e84dff156478"
+    $env:AZURE_TENANT_ID = "9bea5862-7310-4237-af4d-3e296ff96446"
 }
 if ($env:AZURE_CONFIG_DIR) {
     Write-Host "  Azure CLI profile: $env:AZURE_CONFIG_DIR" -ForegroundColor DarkGray

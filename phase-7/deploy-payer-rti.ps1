@@ -14,8 +14,8 @@ param (
     [switch]$SkipPayerActivator,
     [switch]$SkipOpsAgent,
     [switch]$SkipGraphAgent,
-    [string]$ExpectedTenantId = "8d038e6a-9b7d-4cb8-bbcf-e84dff156478",
-    [string]$ExpectedSubscriptionId = "9bbee190-dc61-4c58-ab47-1275cb04018f"
+    [string]$ExpectedTenantId = "9bea5862-7310-4237-af4d-3e296ff96446",
+    [string]$ExpectedSubscriptionId = "7d045140-2d3f-4ac9-83ec-c4f2c0b0b143"
 )
 
 Set-StrictMode -Version Latest

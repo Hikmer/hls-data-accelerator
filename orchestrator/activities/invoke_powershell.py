@@ -305,8 +305,8 @@ def _build_deploy_args(config: dict[str, Any]) -> list[str]:
         params = [
             f"-FabricWorkspaceName {_ps_single_quoted(config['fabric_workspace_name'])}",
             f"-Location {_ps_single_quoted(config.get('location', 'eastus'))}",
-            f"-ExpectedTenantId {_ps_single_quoted(config.get('expected_tenant_id', '8d038e6a-9b7d-4cb8-bbcf-e84dff156478'))}",
-            f"-ExpectedSubscriptionId {_ps_single_quoted(config.get('expected_subscription_id', '9bbee190-dc61-4c58-ab47-1275cb04018f'))}",
+            f"-ExpectedTenantId {_ps_single_quoted(config.get('expected_tenant_id', '9bea5862-7310-4237-af4d-3e296ff96446'))}",
+            f"-ExpectedSubscriptionId {_ps_single_quoted(config.get('expected_subscription_id', '7d045140-2d3f-4ac9-83ec-c4f2c0b0b143'))}",
         ]
         if config.get("resource_group_name"):
             params.append(f"-ResourceGroupName {_ps_single_quoted(config['resource_group_name'])}")
@@ -403,8 +403,8 @@ def _build_deploy_args(config: dict[str, Any]) -> list[str]:
         "pwsh", "-NoProfile", "-NonInteractive", "-File",
         str(DEPLOY_SCRIPT),
         "-FabricWorkspaceName", config["fabric_workspace_name"],
-        "-ExpectedTenantId", config.get("expected_tenant_id", "8d038e6a-9b7d-4cb8-bbcf-e84dff156478"),
-        "-ExpectedSubscriptionId", config.get("expected_subscription_id", "9bbee190-dc61-4c58-ab47-1275cb04018f"),
+        "-ExpectedTenantId", config.get("expected_tenant_id", "9bea5862-7310-4237-af4d-3e296ff96446"),
+        "-ExpectedSubscriptionId", config.get("expected_subscription_id", "7d045140-2d3f-4ac9-83ec-c4f2c0b0b143"),
         "-Location", config.get("location", "eastus"),
     ]
 
