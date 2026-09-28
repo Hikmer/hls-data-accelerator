@@ -47,6 +47,23 @@ param chatModelVersion string = '2026-07-09'
 @minValue(10)
 param chatCapacity int = 300
 
+@description('Fabric SQL analytics endpoint host the app reads gold from. The deployment script grants the app identity Viewer on its workspace.')
+param fabricSqlHost string
+
+@description('Gold lakehouse database on fabricSqlHost.')
+param fabricGoldDatabase string
+
+@description('FHIR service URL the app writes to first. The deployment script grants the app identity FHIR Data Contributor on it.')
+param fhirUrl string
+
+// No role assignment here: the Eventhouse lives in the Fabric workspace, and the
+// app identity's workspace Viewer role (granted by the deployment script) covers KQL reads.
+@description('Eventhouse query URI (also the token audience) of the Masimo pulse-oximeter stream the app reads pulse rate and SpO2 from.')
+param eventhouseQueryUri string
+
+@description('KQL database on eventhouseQueryUri holding TelemetryRaw.')
+param eventhouseDatabase string
+
 var suffix = uniqueString(resourceGroup().id)
 var allTags = union(tags, { 'hls-workload': 'cardiology-app', dataClassification: 'synthetic-only' })
 var aiName = '${prefix}-ai-${suffix}'
@@ -209,6 +226,11 @@ resource app 'Microsoft.App/containerApps@2024-03-01' = {
             { name: 'CALDOVA_TICK_MS', value: '2000' }
             { name: 'CALDOVA_REVISION', value: revision }
             { name: 'AZURE_CLIENT_ID', value: appIdentity.properties.clientId }
+            { name: 'CALDOVA_FABRIC_SQL_HOST', value: fabricSqlHost }
+            { name: 'CALDOVA_FABRIC_GOLD_DATABASE', value: fabricGoldDatabase }
+            { name: 'CALDOVA_FHIR_URL', value: fhirUrl }
+            { name: 'CALDOVA_EVENTHOUSE_QUERY_URI', value: eventhouseQueryUri }
+            { name: 'CALDOVA_EVENTHOUSE_DATABASE', value: eventhouseDatabase }
           ]
           probes: useRegistryImage ? [
             {

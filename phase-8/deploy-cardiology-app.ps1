@@ -11,7 +11,20 @@ param (
     # the JMESPath and OData string literals built from it). Bicep caps it at 12.
     # Options = 'None': ValidatePattern ignores case unless told otherwise.
     # \A...\z, not ^...$: .NET's $ also matches before a trailing newline.
-    [ValidatePattern('\A[a-z0-9]{1,12}\z', Options = 'None')][string]$Prefix = "cardioe2e"
+    [ValidatePattern('\A[a-z0-9]{1,12}\z', Options = 'None')][string]$Prefix = "cardioe2e",
+    # HDS data the app serves: it reads gold over the Fabric SQL endpoint (the
+    # app identity gets Viewer on the workspace) and writes FHIR first (FHIR
+    # Data Contributor on the service). Defaults: the med-0906 environment.
+    [ValidatePattern('\A[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\z')][string]$FabricWorkspaceId = "f8f84d68-cfa1-4460-95d1-943fac43248a",
+    [ValidatePattern('\A[a-z0-9-]+\.datawarehouse\.fabric\.microsoft\.com\z')][string]$FabricSqlHost = "nkhahdl5to4ezo6p5bg76flepa-nbg7r6fbz5qejforsq72yqzeri.datawarehouse.fabric.microsoft.com",
+    [ValidatePattern('\A[A-Za-z0-9_]{1,128}\z')][string]$FabricGoldDatabase = "healthcare1_reporting_gold",
+    [ValidatePattern('\A/subscriptions/[0-9a-f-]{36}/resourceGroups/[A-Za-z0-9._()-]+/providers/Microsoft\.HealthcareApis/workspaces/[a-z0-9]+/fhirservices/[a-z0-9]+\z')][string]$FhirServiceId = "/subscriptions/9bbee190-dc61-4c58-ab47-1275cb04018f/resourceGroups/rg-med-0906/providers/Microsoft.HealthcareApis/workspaces/hdwsfrzkspw34dzci/fhirservices/fhirfrzkspw34dzci",
+    [ValidatePattern('\Ahttps://[a-z0-9-]+\.fhir\.azurehealthcareapis\.com\z')][string]$FhirUrl = "https://hdwsfrzkspw34dzci-fhirfrzkspw34dzci.fhir.azurehealthcareapis.com",
+    # Masimo pulse-oximeter stream the app reads pulse rate and SpO2 from: an
+    # Eventhouse KQL database in workspace -FabricWorkspaceId. No extra grant:
+    # the identity's workspace Viewer role covers KQL reads there.
+    [ValidatePattern('\Ahttps://[a-z0-9-]+(\.[a-z0-9-]+)?\.kusto\.fabric\.microsoft\.com\z')][string]$EventhouseQueryUri = "https://trd-0vj4c1a07qab5cxg8f.z0.kusto.fabric.microsoft.com",
+    [ValidatePattern('\A[A-Za-z0-9_.-]{1,260}\z')][string]$EventhouseDatabase = "MasimoEventhouse"
 )
 
 # Phase 8 — Cardiology App.
@@ -24,6 +37,11 @@ param (
 # Only accounts assigned to the app registration can sign in: the deploying
 # az user always, plus -CardiologyAppUsers. /api/health stays anonymous so the
 # orchestrator can probe it.
+#
+# The app's user-assigned identity is given the HDS access its live profile
+# needs (Viewer on Fabric workspace -FabricWorkspaceId, FHIR Data Contributor on
+# -FhirServiceId) before any revision that uses it is deployed. Workspace Viewer
+# also covers its KQL reads of -EventhouseDatabase, so that needs no grant.
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
@@ -35,6 +53,8 @@ $AppRepo = "kfprugger/caldova-cardio-e2e"
 $AppBranch = "feature/cardiology-integration"
 $ImageRepo = "cardiology-app"
 $DefaultAccessRole = "00000000-0000-0000-0000-000000000000"
+$FhirDataContributor = "5a1fc7df-4bf1-4951-a576-89034ee01acd"
+$FabricApi = "https://api.fabric.microsoft.com"
 
 function Invoke-Az {
     param ([Parameter(Mandatory)][string[]]$Arguments, [switch]$AllowFailure)
@@ -160,6 +180,11 @@ function Deploy-Template {
             chatModel = @{ value = $chat.Name }
             chatModelVersion = @{ value = $chat.Version }
             chatCapacity = @{ value = $chat.Capacity }
+            fabricSqlHost = @{ value = $FabricSqlHost }
+            fabricGoldDatabase = @{ value = $FabricGoldDatabase }
+            fhirUrl = @{ value = $FhirUrl }
+            eventhouseQueryUri = @{ value = $EventhouseQueryUri }
+            eventhouseDatabase = @{ value = $EventhouseDatabase }
         }
         # A container app deployment replaces its whole secret set; pass the
         # sign-in secret back so an authenticated app keeps working.
@@ -403,6 +428,110 @@ if ($hasRegistryImage) {
 $acrName = (Invoke-Az @("acr", "list", "-g", $ResourceGroupName, "--query", $acrQuery, "-o", "tsv")).Out.Trim()
 if (-not $acrName) { throw "The cardiology app registry was not found in $ResourceGroupName." }
 Write-Host "  ✓ Infrastructure ready (registry $acrName)" -ForegroundColor Green
+
+# ── HDS access for the app identity ─────────────────────────────────────────
+# The live profile reads gold over the Fabric SQL endpoint and writes FHIR
+# first, with no fallback. The identity exists now (a fresh app's placeholder
+# deployment just created it), and no revision carrying the HDS settings has
+# been built yet: both grants are made and confirmed on their control planes
+# here, before the revision deploy below. A grant is created only when absent;
+# an existing Fabric role of this identity (it is this app's alone) is set to
+# Viewer. No other principal's access is touched.
+$appIdentity = (Invoke-Az @("identity", "show", "-g", $ResourceGroupName, "-n", "$Prefix-app-id",
+    "--query", "{clientId:clientId,principalId:principalId}", "-o", "json")).Out | ConvertFrom-Json
+$appPrincipal = [string](Get-Prop $appIdentity "principalId")
+if (-not $appPrincipal -or -not (Get-Prop $appIdentity "clientId")) { throw "The app identity $Prefix-app-id has no principal or client id." }
+
+# The FHIR URL the app is given must be the service it is granted.
+$fhirAudience = (Invoke-Az @("resource", "show", "--ids", $FhirServiceId,
+    "--query", "properties.authenticationConfiguration.audience", "-o", "tsv")).Out.Trim()
+if ($fhirAudience.TrimEnd("/") -ne $FhirUrl) { throw "FHIR service $FhirServiceId serves '$fhirAudience', not $FhirUrl." }
+
+# Exact-scope assignments only; the service returns the scope in its own casing.
+function Test-FhirGrant {
+    $scopes = @((Invoke-Az @("role", "assignment", "list", "--scope", $FhirServiceId, "--assignee-object-id", $appPrincipal,
+        "--role", $FhirDataContributor, "--query", "[].scope", "-o", "json")).Out | ConvertFrom-Json | ForEach-Object { $_ })
+    return @($scopes | Where-Object { $_ -eq $FhirServiceId }).Count -gt 0
+}
+if (Test-FhirGrant) {
+    Write-Host "  = App identity already has FHIR Data Contributor on the FHIR service" -ForegroundColor Gray
+} else {
+    # A just-created identity can take a minute to reach Azure RBAC.
+    for ($attempt = 1; $attempt -le 3; $attempt++) {
+        try {
+            Invoke-Az @("role", "assignment", "create", "--assignee-object-id", $appPrincipal, "--assignee-principal-type", "ServicePrincipal",
+                "--role", $FhirDataContributor, "--scope", $FhirServiceId, "-o", "none") | Out-Null
+            break
+        } catch {
+            if ($attempt -eq 3) { throw }
+            Write-Host "  FHIR role assignment failed (attempt $attempt/3); waiting 30s for the identity to propagate..." -ForegroundColor Yellow
+            Start-Sleep -Seconds 30
+        }
+    }
+    $deadline = (Get-Date).AddMinutes(2)
+    while (-not (Test-FhirGrant)) {
+        if ((Get-Date) -ge $deadline) { throw "The FHIR Data Contributor assignment for $appPrincipal did not appear on $FhirServiceId within 2 minutes." }
+        Start-Sleep -Seconds 10
+    }
+    Write-Host "  ✓ Granted the app identity FHIR Data Contributor on the FHIR service" -ForegroundColor Green
+}
+
+# Fabric returns {errorCode, message}; az embeds that body in its error text.
+function Get-FabricError([string]$Text) {
+    $body = [regex]::Match($Text, '\{.*\}', [System.Text.RegularExpressions.RegexOptions]::Singleline).Value
+    try {
+        $fabricError = $body | ConvertFrom-Json
+        $code = Get-Prop $fabricError "errorCode"
+        if ($code) { return "${code}: $(Get-Prop $fabricError 'message')" }
+    } catch { }
+    return $Text.Trim()
+}
+function Invoke-Fabric([string]$Method, [string]$Url, $Body = $null) {
+    $arguments = @("rest", "--method", $Method, "--url", $Url, "--resource", $FabricApi, "-o", "json")
+    $bodyFile = $null
+    try {
+        if ($null -ne $Body) {
+            $bodyFile = New-TemporaryFile
+            $Body | ConvertTo-Json -Depth 5 | Set-Content $bodyFile -Encoding utf8
+            $arguments += @("--headers", "Content-Type=application/json", "--body", "@$bodyFile")
+        }
+        $result = Invoke-Az $arguments -AllowFailure
+        if ($result.Code -ne 0) { throw (Get-FabricError $result.Err) }
+        if ($result.Out) { return $result.Out | ConvertFrom-Json }
+    } finally { if ($bodyFile) { Remove-Item $bodyFile -ErrorAction SilentlyContinue } }
+}
+$fabricRolesUrl = "$FabricApi/v1/workspaces/$FabricWorkspaceId/roleAssignments"
+# Fabric pages this collection; follow continuationUri so no assignment is missed.
+function Get-FabricAppRoles {
+    $all = @(); $url = $fabricRolesUrl
+    while ($url) {
+        try { $page = Invoke-Fabric "GET" $url } catch { throw "Could not read the role assignments of Fabric workspace ${FabricWorkspaceId}: $($_.Exception.Message)" }
+        $all += @(Get-Prop $page "value" | Where-Object { $_ })
+        $url = Get-Prop $page "continuationUri"
+    }
+    return ,@($all | Where-Object { (Get-Prop (Get-Prop $_ "principal") "id") -eq $appPrincipal })
+}
+$fabricRoles = Get-FabricAppRoles
+if ($fabricRoles.Count -eq 1 -and (Get-Prop $fabricRoles[0] "role") -eq "Viewer") {
+    Write-Host "  = App identity is already a Viewer of Fabric workspace $FabricWorkspaceId" -ForegroundColor Gray
+} else {
+    try {
+        if ($fabricRoles.Count) {
+            Invoke-Fabric "PATCH" "$fabricRolesUrl/$(Get-Prop $fabricRoles[0] 'id')" @{ role = "Viewer" } | Out-Null
+        } else {
+            Invoke-Fabric "POST" $fabricRolesUrl @{ principal = @{ id = $appPrincipal; type = "ServicePrincipal" }; role = "Viewer" } | Out-Null
+        }
+    } catch {
+        # Verbatim: e.g. a tenant that does not allow service principals says so here.
+        throw "Fabric refused to make the app identity ($appPrincipal) a Viewer of workspace ${FabricWorkspaceId}: $($_.Exception.Message)"
+    }
+    $deadline = (Get-Date).AddMinutes(2)
+    while (-not (($fabricRoles = Get-FabricAppRoles).Count -eq 1 -and (Get-Prop $fabricRoles[0] "role") -eq "Viewer")) {
+        if ((Get-Date) -ge $deadline) { throw "The app identity ($appPrincipal) was not a Viewer of Fabric workspace $FabricWorkspaceId within 2 minutes." }
+        Start-Sleep -Seconds 10
+    }
+    Write-Host "  ✓ Made the app identity a Viewer of Fabric workspace $FabricWorkspaceId" -ForegroundColor Green
+}
 
 
 # For a fresh app the environment exists only now; for an existing one this

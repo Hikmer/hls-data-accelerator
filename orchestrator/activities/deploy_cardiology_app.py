@@ -15,6 +15,17 @@ from activities.invoke_powershell import (
 
 SCRIPT = Path(__file__).resolve().parents[2] / "phase-8" / "deploy-cardiology-app.ps1"
 
+# HDS access, config key -> script parameter. Unset keys keep the script's defaults.
+HDS_PARAMETERS = {
+    "cardiology_fabric_workspace_id": "FabricWorkspaceId",
+    "cardiology_fabric_sql_host": "FabricSqlHost",
+    "cardiology_fabric_gold_database": "FabricGoldDatabase",
+    "cardiology_fhir_service_id": "FhirServiceId",
+    "cardiology_fhir_url": "FhirUrl",
+    "cardiology_eventhouse_query_uri": "EventhouseQueryUri",
+    "cardiology_eventhouse_database": "EventhouseDatabase",
+}
+
 
 def run(config: dict[str, Any], resources: dict[str, Any]) -> dict[str, Any]:
     """Invoke the Phase 8 script with the orchestrator config."""
@@ -30,6 +41,9 @@ def run(config: dict[str, Any], resources: dict[str, Any]) -> dict[str, Any]:
         params.append(f"-CardiologyAppPath {_ps_single_quoted(config['cardiology_app_path'])}")
     if config.get("cardiology_app_users"):
         params.append(f"-CardiologyAppUsers {_ps_array_literal(config['cardiology_app_users'])}")
+    for key, parameter in HDS_PARAMETERS.items():
+        if config.get(key):
+            params.append(f"-{parameter} {_ps_single_quoted(config[key])}")
 
     command = f"& {_ps_single_quoted(str(SCRIPT))} {' '.join(params)}"
     exit_code = _run_powershell(

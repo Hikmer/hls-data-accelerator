@@ -110,6 +110,14 @@ param (
     # ── Phase 8 (Cardiology App) ──
     [string]$CardiologyAppPath = "",       # Local checkout of kfprugger/caldova-cardio-e2e; empty = sibling of this repo (cloned if missing)
     [string[]]$CardiologyAppUsers = @(),   # Extra UPNs allowed to sign in; the deploying az user is always allowed
+    # HDS data the app serves and the identity is granted; empty = phase-8/deploy-cardiology-app.ps1's default (med-0906)
+    [string]$CardiologyFabricWorkspaceId = "",   # Fabric workspace (app identity gets Viewer)
+    [string]$CardiologyFabricSqlHost = "",       # Fabric SQL analytics endpoint host
+    [string]$CardiologyFabricGoldDatabase = "",  # Gold lakehouse database on that endpoint
+    [string]$CardiologyFhirServiceId = "",       # FHIR service resource id (app identity gets FHIR Data Contributor)
+    [string]$CardiologyFhirUrl = "",             # That FHIR service's URL
+    [string]$CardiologyEventhouseQueryUri = "",  # Masimo Eventhouse query URI (read under the workspace Viewer role)
+    [string]$CardiologyEventhouseDatabase = "",  # KQL database on that Eventhouse
 
     # ── Phase 4 (Activator) ──
     [string]$AlertEmail = "",               # Email for clinical alert notifications (e.g. joey@brakeat.com)
@@ -1305,6 +1313,14 @@ function Invoke-CardiologyAppPhase {
     Invoke-Step -StepName "Phase 8: Cardiology App" `
         -Description "Build the cardiology app image, deploy it to Container Apps, and put Entra sign-in in front of it" -Action {
         $global:LASTEXITCODE = 0
+        $hdsAccess = @{}
+        if ($CardiologyFabricWorkspaceId) { $hdsAccess.FabricWorkspaceId = $CardiologyFabricWorkspaceId }
+        if ($CardiologyFabricSqlHost) { $hdsAccess.FabricSqlHost = $CardiologyFabricSqlHost }
+        if ($CardiologyFabricGoldDatabase) { $hdsAccess.FabricGoldDatabase = $CardiologyFabricGoldDatabase }
+        if ($CardiologyFhirServiceId) { $hdsAccess.FhirServiceId = $CardiologyFhirServiceId }
+        if ($CardiologyFhirUrl) { $hdsAccess.FhirUrl = $CardiologyFhirUrl }
+        if ($CardiologyEventhouseQueryUri) { $hdsAccess.EventhouseQueryUri = $CardiologyEventhouseQueryUri }
+        if ($CardiologyEventhouseDatabase) { $hdsAccess.EventhouseDatabase = $CardiologyEventhouseDatabase }
         & "$ScriptDir/phase-8/deploy-cardiology-app.ps1" `
             -ResourceGroupName $ResourceGroupName `
             -Location $Location `
@@ -1312,7 +1328,8 @@ function Invoke-CardiologyAppPhase {
             -ExpectedTenantId $ExpectedTenantId `
             -ExpectedSubscriptionId $ExpectedSubscriptionId `
             -CardiologyAppPath $CardiologyAppPath `
-            -CardiologyAppUsers $CardiologyAppUsers
+            -CardiologyAppUsers $CardiologyAppUsers `
+            @hdsAccess
         Assert-LastExternalCommandSucceeded "deploy-cardiology-app.ps1"
     }
 }

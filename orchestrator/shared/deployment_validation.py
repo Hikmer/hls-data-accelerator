@@ -14,6 +14,16 @@ import urllib.request
 from collections.abc import Callable
 from typing import Any
 
+from shared.models import (
+    CARDIOLOGY_EVENTHOUSE_DATABASE,
+    CARDIOLOGY_EVENTHOUSE_QUERY_URI,
+    CARDIOLOGY_FABRIC_GOLD_DATABASE,
+    CARDIOLOGY_FABRIC_SQL_HOST,
+    CARDIOLOGY_FABRIC_WORKSPACE_ID,
+    CARDIOLOGY_FHIR_SERVICE_ID,
+    CARDIOLOGY_FHIR_URL,
+)
+
 
 def _check(name: str, passed: bool, detail: str) -> dict[str, str]:
     return {"name": name, "status": "pass" if passed else "fail", "detail": detail}
@@ -578,6 +588,70 @@ def cardiology_sign_in_check(config: dict[str, Any], az_run: Callable[..., Any])
                   + (f"; {policy_problem}" if policy_problem else ""))
 
 
+CARDIOLOGY_HDS_ACCESS_CHECK_NAME = "Cardiology app HDS access"
+FHIR_DATA_CONTRIBUTOR_ROLE = "5a1fc7df-4bf1-4951-a576-89034ee01acd"
+FABRIC_API = "https://api.fabric.microsoft.com"
+
+
+def _cardiology_hds_access_problem(config: dict[str, Any], app_name: str, az_run: Callable[..., Any]) -> str:
+    """The HDS access the deployment script establishes (mirrors its grants):
+    the app runs as one user-assigned identity, is configured for the requested
+    Fabric gold endpoint, FHIR service and Masimo Eventhouse (AZURE_CLIENT_ID
+    naming that identity), and the identity holds FHIR Data Contributor on the
+    FHIR service and exactly Viewer on the Fabric workspace (which also covers
+    its KQL reads of the Eventhouse)."""
+    fhir_service_id = str(config.get("cardiology_fhir_service_id") or CARDIOLOGY_FHIR_SERVICE_ID)
+    workspace_id = str(config.get("cardiology_fabric_workspace_id") or CARDIOLOGY_FABRIC_WORKSPACE_ID)
+    scope = ["-g", str(config.get("resource_group_name") or ""), "-n", app_name]
+    if config.get("expected_subscription_id"):
+        scope += ["--subscription", str(config["expected_subscription_id"])]
+    try:
+        app = _az_json(az_run, ["az", "containerapp", "show", *scope, "--query",
+                                "{identities: identity.userAssignedIdentities, env: properties.template.containers[0].env}"], dict)
+        identities = list((app.get("identities") or {}).values())
+        if len(identities) != 1:
+            return f"the app runs as {len(identities)} user-assigned identities, not exactly one"
+        principal, client = str(identities[0]["principalId"]), str(identities[0]["clientId"])
+        env = {item.get("name"): item.get("value") for item in app.get("env") or []}
+        wanted_env = {
+            "CALDOVA_FABRIC_SQL_HOST": str(config.get("cardiology_fabric_sql_host") or CARDIOLOGY_FABRIC_SQL_HOST),
+            "CALDOVA_FABRIC_GOLD_DATABASE": str(config.get("cardiology_fabric_gold_database") or CARDIOLOGY_FABRIC_GOLD_DATABASE),
+            "CALDOVA_FHIR_URL": str(config.get("cardiology_fhir_url") or CARDIOLOGY_FHIR_URL),
+            "CALDOVA_EVENTHOUSE_QUERY_URI": str(config.get("cardiology_eventhouse_query_uri") or CARDIOLOGY_EVENTHOUSE_QUERY_URI),
+            "CALDOVA_EVENTHOUSE_DATABASE": str(config.get("cardiology_eventhouse_database") or CARDIOLOGY_EVENTHOUSE_DATABASE),
+            "AZURE_CLIENT_ID": client,
+        }
+        if wrong := sorted(name for name, value in wanted_env.items() if env.get(name) != value):
+            return f"app settings differ from the requested HDS access: {', '.join(wrong)}"
+
+        scopes = _az_json(az_run, ["az", "role", "assignment", "list", "--scope", fhir_service_id, "--assignee-object-id", principal,
+                                   "--role", FHIR_DATA_CONTRIBUTOR_ROLE, "--query", "[].scope"], list)
+        if fhir_service_id.lower() not in {str(s).lower() for s in scopes}:
+            return "the app identity lacks FHIR Data Contributor on the FHIR service"
+
+        roles: list[str] = []
+        url = f"{FABRIC_API}/v1/workspaces/{workspace_id}/roleAssignments"
+        while url:  # Fabric pages this collection
+            page = _az_json(az_run, ["az", "rest", "--method", "GET", "--url", url, "--resource", FABRIC_API], dict)
+            roles += [str(a.get("role")) for a in page.get("value") or [] if (a.get("principal") or {}).get("id") == principal]
+            url = page.get("continuationUri")
+        if roles != ["Viewer"]:
+            return f"the app identity's Fabric workspace roles are {roles or 'none'}, not exactly Viewer"
+    except (KeyError, TypeError, AttributeError, RuntimeError, ValueError) as exc:  # ValueError: bad JSON
+        return f"could not verify HDS access: {exc}"
+    return ""
+
+
+def cardiology_hds_access_check(config: dict[str, Any], az_run: Callable[..., Any]) -> dict[str, str]:
+    """The deployed app can reach the HDS data its live profile requires."""
+    _fqdn, app_name, error = _cardiology_app(config, az_run)
+    if not app_name:
+        return _check(CARDIOLOGY_HDS_ACCESS_CHECK_NAME, False, error)
+    problem = _cardiology_hds_access_problem(config, app_name, az_run)
+    return _check(CARDIOLOGY_HDS_ACCESS_CHECK_NAME, not problem,
+                  problem or "FHIR Data Contributor on the FHIR service; Viewer on the Fabric workspace; app settings match")
+
+
 def _eventhub_consumption_check(resources: dict[str, Any], config: dict[str, Any], az_run: Callable[..., Any], entity_name: str) -> dict[str, str]:
     namespaces = _azure(resources, "Microsoft.EventHub/namespaces")
     check_name = f"Eventstream consumption: {entity_name}"
@@ -705,4 +779,5 @@ def runtime_feature_checks(
     if cardiology_app_expected(config):
         checks.append(cardiology_app_check(config, az_run))
         checks.append(cardiology_sign_in_check(config, az_run))
+        checks.append(cardiology_hds_access_check(config, az_run))
     return checks

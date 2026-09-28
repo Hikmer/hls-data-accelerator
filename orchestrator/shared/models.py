@@ -8,6 +8,22 @@ from typing import Any
 
 from pydantic import BaseModel, Field, model_validator
 
+# HDS data the Phase 8 cardiology app serves (the med-0906 environment). The
+# deployer gives the app identity Viewer on the Fabric workspace and FHIR Data
+# Contributor on the FHIR service; validation checks both.
+CARDIOLOGY_FABRIC_WORKSPACE_ID = "f8f84d68-cfa1-4460-95d1-943fac43248a"
+CARDIOLOGY_FABRIC_SQL_HOST = "nkhahdl5to4ezo6p5bg76flepa-nbg7r6fbz5qejforsq72yqzeri.datawarehouse.fabric.microsoft.com"
+CARDIOLOGY_FABRIC_GOLD_DATABASE = "healthcare1_reporting_gold"
+CARDIOLOGY_FHIR_SERVICE_ID = (
+    "/subscriptions/9bbee190-dc61-4c58-ab47-1275cb04018f/resourceGroups/rg-med-0906"
+    "/providers/Microsoft.HealthcareApis/workspaces/hdwsfrzkspw34dzci/fhirservices/fhirfrzkspw34dzci"
+)
+CARDIOLOGY_FHIR_URL = "https://hdwsfrzkspw34dzci-fhirfrzkspw34dzci.fhir.azurehealthcareapis.com"
+# Masimo pulse-oximeter Eventhouse in that workspace; workspace Viewer covers the
+# app's KQL reads, so it needs no grant of its own.
+CARDIOLOGY_EVENTHOUSE_QUERY_URI = "https://trd-0vj4c1a07qab5cxg8f.z0.kusto.fabric.microsoft.com"
+CARDIOLOGY_EVENTHOUSE_DATABASE = "MasimoEventhouse"
+
 
 class PhaseStatus(str, Enum):
     PENDING = "pending"
@@ -75,6 +91,13 @@ class DeploymentConfig(BaseModel):
     phase8_only: bool = False
     cardiology_app_path: str = ""
     cardiology_app_users: list[str] = Field(default_factory=list)
+    cardiology_fabric_workspace_id: str = CARDIOLOGY_FABRIC_WORKSPACE_ID
+    cardiology_fabric_sql_host: str = CARDIOLOGY_FABRIC_SQL_HOST
+    cardiology_fabric_gold_database: str = CARDIOLOGY_FABRIC_GOLD_DATABASE
+    cardiology_fhir_service_id: str = CARDIOLOGY_FHIR_SERVICE_ID
+    cardiology_fhir_url: str = CARDIOLOGY_FHIR_URL
+    cardiology_eventhouse_query_uri: str = CARDIOLOGY_EVENTHOUSE_QUERY_URI
+    cardiology_eventhouse_database: str = CARDIOLOGY_EVENTHOUSE_DATABASE
     # Phase 3 / 4
     dicom_toolkit_path: str = ""
     alert_email: str = ""

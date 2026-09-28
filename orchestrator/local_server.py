@@ -270,10 +270,20 @@ from shared.deployment_validation import (
     CARDIOLOGY_WORKLOAD_VALUE,
     cardiology_app_check,
     cardiology_app_resources,
+    cardiology_hds_access_check,
     cardiology_sign_in_check,
     effective_validation_config,
     feature_presence_checks,
     runtime_feature_checks,
+)
+from shared.models import (
+    CARDIOLOGY_EVENTHOUSE_DATABASE,
+    CARDIOLOGY_EVENTHOUSE_QUERY_URI,
+    CARDIOLOGY_FABRIC_GOLD_DATABASE,
+    CARDIOLOGY_FABRIC_SQL_HOST,
+    CARDIOLOGY_FABRIC_WORKSPACE_ID,
+    CARDIOLOGY_FHIR_SERVICE_ID,
+    CARDIOLOGY_FHIR_URL,
 )
 
 # Migrate from old JSON state file if it exists
@@ -749,6 +759,13 @@ class DeployRequest(BaseModel):
     cardiology_app_reused: bool = False
     cardiology_app_path: str = ""
     cardiology_app_users: list[str] = []
+    cardiology_fabric_workspace_id: str = CARDIOLOGY_FABRIC_WORKSPACE_ID
+    cardiology_fabric_sql_host: str = CARDIOLOGY_FABRIC_SQL_HOST
+    cardiology_fabric_gold_database: str = CARDIOLOGY_FABRIC_GOLD_DATABASE
+    cardiology_fhir_service_id: str = CARDIOLOGY_FHIR_SERVICE_ID
+    cardiology_fhir_url: str = CARDIOLOGY_FHIR_URL
+    cardiology_eventhouse_query_uri: str = CARDIOLOGY_EVENTHOUSE_QUERY_URI
+    cardiology_eventhouse_database: str = CARDIOLOGY_EVENTHOUSE_DATABASE
     dicom_toolkit_path: str = ""
     phase7_only: bool = False
     phase2_only: bool = False
@@ -1633,7 +1650,11 @@ def _phase_live_prerequisites_ok(req: DeployRequest, phase_name: str, evidence: 
         sign_in = cardiology_sign_in_check(req.model_dump(), _az_run)
         if sign_in["status"] != "pass":
             return (False, f"Cardiology app sign-in check failed: {sign_in['detail']}")
-        return (True, f"Cardiology app verified: {health['detail']}; {sign_in['detail']}")
+        # Likewise an app without the HDS access its live profile needs.
+        hds_access = cardiology_hds_access_check(req.model_dump(), _az_run)
+        if hds_access["status"] != "pass":
+            return (False, f"Cardiology app HDS access check failed: {hds_access['detail']}")
+        return (True, f"Cardiology app verified: {health['detail']}; {sign_in['detail']}; {hds_access['detail']}")
 
     return (True, "No extra live prerequisite check required")
 

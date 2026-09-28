@@ -297,6 +297,19 @@ def run_preflight(config: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
+# Phase 8 HDS access, config key -> Deploy-All parameter. Unset keys fall back
+# to deploy-cardiology-app.ps1's defaults.
+CARDIOLOGY_HDS_PARAMETERS = {
+    "cardiology_fabric_workspace_id": "CardiologyFabricWorkspaceId",
+    "cardiology_fabric_sql_host": "CardiologyFabricSqlHost",
+    "cardiology_fabric_gold_database": "CardiologyFabricGoldDatabase",
+    "cardiology_fhir_service_id": "CardiologyFhirServiceId",
+    "cardiology_fhir_url": "CardiologyFhirUrl",
+    "cardiology_eventhouse_query_uri": "CardiologyEventhouseQueryUri",
+    "cardiology_eventhouse_database": "CardiologyEventhouseDatabase",
+}
+
+
 def _build_deploy_args(config: dict[str, Any]) -> list[str]:
     """Build the pwsh command line for Deploy-All.ps1."""
     if config.get("reuse_patients") and config.get("reseed_data"):
@@ -331,6 +344,9 @@ def _build_deploy_args(config: dict[str, Any]) -> list[str]:
             params.append(f"-CardiologyAppPath {_ps_single_quoted(config['cardiology_app_path'])}")
         if config.get("cardiology_app_users"):
             params.append(f"-CardiologyAppUsers {_ps_array_literal(config['cardiology_app_users'])}")
+        for key, parameter in CARDIOLOGY_HDS_PARAMETERS.items():
+            if config.get(key):
+                params.append(f"-{parameter} {_ps_single_quoted(config[key])}")
         if config.get("capacity_subscription_id"):
             params.append(f"-CapacitySubscriptionId {_ps_single_quoted(config['capacity_subscription_id'])}")
         if config.get("capacity_resource_group"):
@@ -439,6 +455,9 @@ def _build_deploy_args(config: dict[str, Any]) -> list[str]:
         args += ["-CardiologyAppPath", config["cardiology_app_path"]]
     if config.get("cardiology_app_users"):
         args += ["-CardiologyAppUsers", ",".join(str(user) for user in config["cardiology_app_users"])]
+    for key, parameter in CARDIOLOGY_HDS_PARAMETERS.items():
+        if config.get(key):
+            args += [f"-{parameter}", config[key]]
     if config.get("capacity_subscription_id"):
         args += ["-CapacitySubscriptionId", config["capacity_subscription_id"]]
     if config.get("capacity_resource_group"):
