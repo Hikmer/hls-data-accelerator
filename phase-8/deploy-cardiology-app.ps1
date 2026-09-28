@@ -10,7 +10,8 @@ param (
     # Lowercase letters and digits only (Azure naming; also keeps it inert inside
     # the JMESPath and OData string literals built from it). Bicep caps it at 12.
     # Options = 'None': ValidatePattern ignores case unless told otherwise.
-    [ValidatePattern('^[a-z0-9]{1,12}$', Options = 'None')][string]$Prefix = "cardioe2e"
+    # \A...\z, not ^...$: .NET's $ also matches before a trailing newline.
+    [ValidatePattern('\A[a-z0-9]{1,12}\z', Options = 'None')][string]$Prefix = "cardioe2e"
 )
 
 # Phase 8 — Cardiology App.
