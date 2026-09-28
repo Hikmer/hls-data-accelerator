@@ -123,11 +123,17 @@ def build_observation(device_id, patient_ref, field, window_start, window_minute
 def parse_associations(resources):
     """Map device id -> Patient reference from Basic device-assoc resources.
 
+    Only a Basic whose FIRST code coding is device-assoc counts: the FHIR
+    `code` search also matches later codings, and gold (cardiology_gold_projection)
+    applies the first-coding rule, so both must select the same links.
     Inactive associations are ignored. A device linked to more than one patient
     is ambiguous and left out, as is a link without a Patient subject.
     """
     patients_by_device = {}
     for resource in resources:
+        codings = (resource.get("code") or {}).get("coding") or [{}]
+        if codings[0].get("code") != "device-assoc":
+            continue
         extensions = resource.get("extension") or []
         status = next((e.get("valueCode") for e in extensions
                        if str(e.get("url", "")).endswith(STATUS_EXTENSION_SUFFIXES)), None)

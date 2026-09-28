@@ -79,13 +79,18 @@ def test_summary_row_becomes_observations_only_for_associated_devices():
 
 
 def test_associations_never_guess_a_subject():
-    def assoc(device, subject, status="active", url="http://example.org/StructureDefinition/associated-device"):
-        return {"resourceType": "Basic", "subject": {"reference": subject}, "extension": [
+    def assoc(device, subject, status="active", url="http://example.org/StructureDefinition/associated-device",
+              codes=("device-assoc",)):
+        return {"resourceType": "Basic", "code": {"coding": [{"code": c} for c in codes]},
+                "subject": {"reference": subject}, "extension": [
             {"url": url, "valueReference": {"reference": f"Device/{device}"}},
             {"url": "http://example.org/StructureDefinition/association-status", "valueCode": status}]}
 
     unique, ambiguous = aggregator.parse_associations([
         assoc("D1", "Patient/a"),
+        # A `code=device-assoc` search also returns this one, but its first coding isn't device-assoc:
+        # it must not count, or D1 would turn ambiguous here while gold still assigns it to Patient/a.
+        assoc("D1", "Patient/z", codes=("local-assoc", "device-assoc")),
         assoc("D2", "Patient/b", url="http://hl7.org/fhir/StructureDefinition/device-association-device"),
         assoc("D3", "Patient/c", status="inactive"),
         assoc("D4", "Patient/d"), assoc("D4", "Patient/e"),
