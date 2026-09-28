@@ -1,0 +1,3 @@
+# No third-party runtime dependencies: aggregator.py uses the Python standard
+# library only (managed identity tokens come from the Container Apps
+# IDENTITY_ENDPOINT; locally from the az CLI). Tests need pytest.
