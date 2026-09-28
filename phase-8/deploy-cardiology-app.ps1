@@ -7,7 +7,10 @@ param (
     [string]$ExpectedSubscriptionId = "9bbee190-dc61-4c58-ab47-1275cb04018f",
     [string]$CardiologyAppPath = "",
     [string[]]$CardiologyAppUsers = @(),
-    [string]$Prefix = "cardioe2e"
+    # Lowercase letters and digits only (Azure naming; also keeps it inert inside
+    # the JMESPath and OData string literals built from it). Bicep caps it at 12.
+    # Options = 'None': ValidatePattern ignores case unless told otherwise.
+    [ValidatePattern('^[a-z0-9]{1,12}$', Options = 'None')][string]$Prefix = "cardioe2e"
 )
 
 # Phase 8 — Cardiology App.
