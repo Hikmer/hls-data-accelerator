@@ -11,6 +11,12 @@ CYAN='\033[0;36m'
 NC='\033[0m'
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+CHECK_ONLY=0
+for argument in "$@"; do
+    case "$argument" in
+        -[Cc][Hh][Ee][Cc][Kk][Oo][Nn][Ll][Yy]) CHECK_ONLY=1 ;;
+    esac
+done
 
 echo ""
 echo -e "${CYAN}+============================================================+${NC}"
@@ -44,6 +50,11 @@ if command -v pwsh &> /dev/null; then
     PWSH_VER=$(pwsh --version 2>/dev/null)
     echo -e "  ${GREEN}✓ PowerShell Core ($PWSH_VER)${NC}"
 else
+    if [[ "$CHECK_ONLY" == 1 ]]; then
+        echo -e "  ${RED}PowerShell Core not found; CheckOnly will not install it.${NC}"
+        echo "  Install: https://learn.microsoft.com/powershell/scripting/install/installing-powershell"
+        exit 1
+    fi
     echo -e "  ${YELLOW}PowerShell Core not found — installing...${NC}"
     echo ""
 
@@ -119,12 +130,19 @@ if ! command -v node &> /dev/null; then
     MISSING=1
 fi
 
-if ! command -v python3 &> /dev/null; then
-    echo -e "  ${YELLOW}Python 3 not found${NC}"
+HAS_PYTHON=0
+for candidate in python3.14 python3.13 python3 python; do
+    if command -v "$candidate" &> /dev/null && "$candidate" -I -B -c 'import sys; sys.exit(not ((3, 13) <= sys.version_info[:2] <= (3, 14)))' 2>/dev/null; then
+        HAS_PYTHON=1
+        break
+    fi
+done
+if [[ "$HAS_PYTHON" == 0 ]]; then
+    echo -e "  ${YELLOW}Python 3.13-3.14 not found${NC}"
     if [[ "$PLATFORM" == "macOS" ]]; then
-        echo -e "    Install: ${CYAN}brew install python@3.12${NC}"
+        echo -e "    Install: ${CYAN}brew install python@3.13${NC}"
     else
-        echo -e "    Install: ${CYAN}sudo apt-get install -y python3 python3-venv python3-pip${NC}"
+        echo -e "    Install Python 3.13 or 3.14 with venv support from your distribution or https://www.python.org/downloads/."
     fi
     MISSING=1
 fi

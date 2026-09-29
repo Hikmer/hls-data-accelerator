@@ -64,6 +64,8 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $VerbosePreference = 'Continue'
 $InformationPreference = 'Continue'
+$hlsRepoRoot = Split-Path -Parent $PSScriptRoot
+. (Join-Path $hlsRepoRoot 'utilities/python-runtime.ps1')
 
 $FabricManagementEndpoint = 'https://api.fabric.microsoft.com'
 $OneLakeEndpoint = 'https://onelake.dfs.fabric.microsoft.com'
@@ -597,13 +599,17 @@ try:
 finally:
     conn.close()
 "@
-    $executorVariable = Get-Variable -Scope Script -Name LakehouseQueryExecutor -ErrorAction SilentlyContinue
-    $executeQuery = if ($executorVariable) {
-        $executorVariable.Value
-    } else {
-        { param($Script) $Script | python - 2>&1 }
-    }
     try {
+        $executorVariable = Get-Variable -Scope Script -Name LakehouseQueryExecutor -ErrorAction SilentlyContinue
+        $executeQuery = if ($executorVariable) {
+            $executorVariable.Value
+        } else {
+            $windowsHost = $env:OS -eq 'Windows_NT' -or $PSVersionTable.OS -match 'Windows'
+            $runtime = Initialize-PythonVenv -Path (Join-Path $hlsRepoRoot 'orchestrator/.venv') -Windows $windowsHost -CheckOnly
+            if (-not $runtime) { throw 'Lakehouse SQL diagnostics require a compatible orchestrator/.venv. Run ./setup-prereqs.ps1.' }
+            $queryPython = $runtime.executable
+            { param($Script) $Script | & $queryPython - 2>&1 }
+        }
         $maxAttempts = 5
         for ($attempt = 1; $attempt -le $maxAttempts; $attempt++) {
             $result = & $executeQuery $pyScript

@@ -14,16 +14,14 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
 $repoRoot = Split-Path -Parent $PSScriptRoot
+. (Join-Path $repoRoot "utilities/python-runtime.ps1")
 $orchestratorRoot = Join-Path $repoRoot "orchestrator"
-$pythonCandidates = @(
-    (Join-Path $orchestratorRoot ".venv/bin/python"),
-    (Join-Path $orchestratorRoot ".venv/Scripts/python.exe")
-)
-$python = $pythonCandidates | Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } | Select-Object -First 1
-
-if (-not $python) {
-    throw "HDS source deployment requires orchestrator/.venv. Run: pwsh -NoProfile -File ./setup-prereqs.ps1"
+$windowsHost = $env:OS -eq "Windows_NT" -or $PSVersionTable.OS -match "Windows"
+$runtime = Initialize-PythonVenv -Path (Join-Path $orchestratorRoot ".venv") -Windows $windowsHost -CheckOnly
+if (-not $runtime) {
+    throw "HDS source deployment requires a compatible orchestrator/.venv (Windows: Python 3.13 x64; macOS/Linux: Python 3.13-3.14). Run: pwsh -NoProfile -File ./setup-prereqs.ps1"
 }
+$python = $runtime.executable
 
 & $python -c "import requests; import azure.identity" 2>$null
 if ($LASTEXITCODE -ne 0) {

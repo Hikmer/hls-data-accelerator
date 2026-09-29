@@ -340,6 +340,9 @@ ASALocalRun/
 # Code coverage report data files
 coveragetool
 reports/
+# Power BI report definitions are shipped source, not coverage output.
+!hds-build-artifacts/healthcare-artifacts/**/Reports/
+!hds-build-artifacts/healthcare-artifacts/**/Reports/**
 *.cobertura.xml
 
 

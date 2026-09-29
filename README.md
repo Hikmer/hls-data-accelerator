@@ -50,7 +50,7 @@ The browser orchestrator is the recommended path for a first deployment. The CLI
 | Fabric permissions | Ability to create a workspace and Fabric items, publish Data Agents, and use enabled tenant workloads |
 | Entra ID | An existing security group used as the deployment administrator group |
 | Tenant features | Healthcare Data Solutions, Real-Time Intelligence, Data Agents, Fabric IQ/Ontology, Data Activator, and Power BI enabled for the deploying identity |
-| Local tools | Git, PowerShell 7+, Azure CLI 2.50+, Az PowerShell, Bicep, Node.js, and Python 3.10+ |
+| Local tools | Git, PowerShell 7+, Azure CLI 2.50+, Az PowerShell, Bicep, Node.js, and Python 3.13 x64 on Windows or Python 3.13–3.14 on macOS/Linux |
 
 ### 2. Clone and bootstrap
 
@@ -72,6 +72,12 @@ pwsh -NoProfile -File .\setup-prereqs.ps1
 ```
 
 The bootstrap installs or verifies the local toolchain and creates the orchestrator Python environment. Re-run it with `-CheckOnly` after signing in to verify the complete local and cloud context.
+
+On Windows 11 ARM64, bootstrap selects **Python 3.13 x64 under x64 emulation**. PowerShell can remain native ARM64. Native Windows ARM64 Python is rejected because the pinned `cryptography` release has no Windows ARM64 wheel. Bootstrap recreates an incompatible orchestrator `.venv`; `-CheckOnly` never installs Python or changes the environment.
+
+The repository contains source, configuration, and empty HDS table schemas, not bundled Synthea or Microsoft sample datasets. `-UseCachedSynthea` generates and validates the deterministic 100-patient cohort locally under ignored `synthea/.generated/` before upload. Microsoft sample-driven tools require separately supplied local data; see the [HDS setup guide](fabric-rti/HDS-SETUP-GUIDE.md).
+
+Bootstrap installs the development-only Parquet inspector and enables `.githooks/pre-push` when no custom hook directory is configured. The hook checks every outgoing commit before Git sends it, including intermediate commits later deleting a dataset. Existing custom hooks are preserved with an integration warning. CI also checks the committed source tree. Run `orchestrator/.venv/bin/python utilities/check_repository_data.py` before committing, or `& .\orchestrator\.venv\Scripts\python.exe .\utilities\check_repository_data.py` on Windows. The check reads Git's index, so cleaning only an unstaged working file cannot hide staged data.
 
 ### 3. Sign in to one tenant and subscription
 
@@ -222,7 +228,7 @@ hls-data-accelerator/
 ├── orchestrator/                   # FastAPI backend and deployment activities
 ├── orchestrator-ui/                # React + Fluent UI frontend
 ├── eval/                           # API-first deployment evaluation harness
-├── vendor/microsoft-hds/1.4.0/     # Immutable vendored Microsoft HDS source
+├── vendor/microsoft-hds/1.4.0/     # Microsoft HDS source and empty schemas; no bundled datasets
 └── docs/                           # Phase guides and interactive Archify diagrams
 ```
 

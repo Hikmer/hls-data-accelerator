@@ -112,7 +112,7 @@ Do not treat the standalone scripts as a substitute for `Deploy-All.ps1` when yo
 
 | Switch | Behavior |
 |---|---|
-| `-UseCachedSynthea` | Loads the canonical cached 100-patient fixture |
+| `-UseCachedSynthea` | Generates and validates the deterministic 100-patient cohort locally, then uploads it |
 | `-ReusePatients` | Keeps the current FHIR cohort and performs the downstream catch-up work |
 | `-ReseedData` | Permanently replaces the current FHIR data before loading the requested cohort |
 | `-ScaffoldingOnly` | Creates definitions and infrastructure without starting data producers or ingestion |
@@ -121,7 +121,9 @@ Do not treat the standalone scripts as a substitute for `Deploy-All.ps1` when yo
 | `-SkipDicom` | Skips TCIA download, re-tagging, and ImagingStudy creation |
 | `-RebuildContainers` | Forces cloud container image rebuilds |
 
-`-ReusePatients` and `-ReseedData` are mutually exclusive.
+`-ReusePatients` and `-ReseedData` are mutually exclusive. Reuse never silently falls back to generating a new cohort. Infrastructure-only mode does not prepare or upload patient data.
+
+Canonical mode no longer reads bundles from Git. It uses the verified orchestrator Python environment to run `synthea/generate_cached_bundles.py` and `synthea/validate_canonical_fixture.py`. Output and checksums live under ignored `synthea/.generated/`. Generation or validation failure stops before deleting or replacing the existing cloud blob set. The loader's cloud manifest remains `_control/canonical-fixture-manifest.json`.
 
 ## Verify before Phase 2
 

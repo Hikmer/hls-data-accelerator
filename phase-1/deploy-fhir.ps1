@@ -896,7 +896,7 @@ $containerName = "synthea-output"
 # ============================================
 # STEP 1.5: Reuse / Clone Patients Validation
 # ============================================
-if ($ReusePatients -or $SourceResourceGroup) {
+if (($ReusePatients -or $SourceResourceGroup) -and ($doSynthea -or $doLoader -or $doDicom)) {
     Write-Host ""
     Write-Host "--- STEP 1.5: REUSE PATIENTS / CLONE DATA ---" -ForegroundColor Cyan
 
@@ -928,6 +928,9 @@ if ($ReusePatients -or $SourceResourceGroup) {
     $dicomBlobs = az storage blob list --account-name $storageAccountName --container-name "dicom-output" --num-results 1 --auth-mode login --query "[0].name" -o tsv 2>$null
 
     if (-not $syntheaBlobs) {
+        if ($ReusePatients) {
+            throw "Reuse patients requested, but synthea-output is empty. Explicitly request generation or reseeding instead."
+        }
         Write-Host "  ⚠ Warning: Reuse patients requested, but synthea-output is empty!" -ForegroundColor Yellow
         Write-Host "    Falling back to data generation..." -ForegroundColor DarkGray
         $doSynthea = $true
@@ -945,7 +948,10 @@ if ($ReusePatients -or $SourceResourceGroup) {
         }
     }
 
-    if (-not $dicomBlobs) {
+    if ($ReusePatients -and -not $SourceResourceGroup) {
+        $doDicom = $false
+        Write-Host "  Reusing existing patients without generating or loading DICOM data." -ForegroundColor DarkGray
+    } elseif (-not $dicomBlobs) {
         Write-Host "  ⚠ Warning: Reuse patients requested, but dicom-output is empty!" -ForegroundColor Yellow
         Write-Host "    Falling back to TCIA download..." -ForegroundColor DarkGray
         $doDicom = $true
@@ -953,9 +959,6 @@ if ($ReusePatients -or $SourceResourceGroup) {
         $ReusePatients = $false
     } else {
         Write-Host "  ✓ Verified: dicom data exists" -ForegroundColor Green
-        if ($ReusePatients -and -not $SourceResourceGroup) {
-            $doDicom = $false
-        }
     }
 }
 
@@ -1016,10 +1019,18 @@ Write-Host ""
 Write-Host "--- STEP 3: RUNNING SYNTHEA GENERATOR ---" -ForegroundColor Cyan
 
 if ($UseCachedSynthea) {
-    Write-Host "Validating and uploading canonical synthetic fixture..." -ForegroundColor Cyan
-    $fixtureRoot = Join-Path $ScriptDir "synthea"
-    $fixtureValidator = Join-Path $fixtureRoot "validate_canonical_fixture.py"
-    & python3 $fixtureValidator --root $fixtureRoot
+    Write-Host "Generating, validating, and uploading the canonical synthetic fixture..." -ForegroundColor Cyan
+    $fixtureSource = Join-Path $ScriptDir "synthea"
+    $fixtureRoot = Join-Path $fixtureSource ".generated"
+    . (Join-Path $ScriptDir "utilities/python-runtime.ps1")
+    $fixtureRuntime = Initialize-PythonVenv -Path (Join-Path $ScriptDir "orchestrator/.venv") -Windows ($IsWindows -or $env:OS -eq "Windows_NT") -CheckOnly
+    if (-not $fixtureRuntime) {
+        throw "A supported orchestrator/.venv Python runtime is required to generate the canonical fixture. Run setup-prereqs first."
+    }
+    $fixturePython = $fixtureRuntime.executable
+    & $fixturePython (Join-Path $fixtureSource "generate_cached_bundles.py") --output-root $fixtureRoot
+    if ($LASTEXITCODE -ne 0) { throw "Canonical fixture generation failed before upload." }
+    & $fixturePython (Join-Path $fixtureSource "validate_canonical_fixture.py") --root $fixtureRoot
     if ($LASTEXITCODE -ne 0) { throw "Canonical fixture validation failed before upload." }
 
     Write-Host "Clearing the prior fixture blob set..." -ForegroundColor DarkGray

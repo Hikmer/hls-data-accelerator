@@ -2,6 +2,7 @@
 """Generate the deterministic canonical healthcare fixture used by deployments."""
 from __future__ import annotations
 
+import argparse
 import hashlib
 import json
 import random
@@ -362,9 +363,9 @@ def generate_fixture(out_dir: Path, patient_count: int = PATIENT_COUNT) -> dict[
     profiles = []
     for idx in range(patient_count):
         filename, bundle = generate_patient(idx)
-        payload = json.dumps(bundle, indent=2, sort_keys=True) + "\n"
-        (out_dir / filename).write_text(payload)
-        checksums[filename] = hashlib.sha256(payload.encode()).hexdigest()
+        payload = (json.dumps(bundle, indent=2, sort_keys=True) + "\n").encode("utf-8")
+        (out_dir / filename).write_bytes(payload)
+        checksums[filename] = hashlib.sha256(payload).hexdigest()
         resources = [item["resource"] for item in bundle["entry"]]
         counts.update(resource["resourceType"] for resource in resources)
         for resource in resources:
@@ -390,10 +391,15 @@ def generate_fixture(out_dir: Path, patient_count: int = PATIENT_COUNT) -> dict[
 
 
 def main() -> None:
-    root = Path(__file__).resolve().parent
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--output-root", type=Path, default=Path(__file__).resolve().parent / ".generated",
+        help="Directory for generated prepackaged bundles and their canonical manifest",
+    )
+    root = parser.parse_args().output_root
     manifest = generate_fixture(root / "prepackaged")
     manifest_path = root / "canonical-fixture-manifest.json"
-    manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
+    manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8", newline="\n")
     print(f"Generated {manifest['patientCount']} patients and {sum(manifest['resourceCounts'].values())} resources")
     print(f"Manifest: {manifest_path}")
 

@@ -26,12 +26,11 @@ param(
 
 $ErrorActionPreference = "Stop"
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+. (Join-Path $ScriptDir "utilities/python-runtime.ps1")
+$isWin = $env:OS -eq "Windows_NT" -or $PSVersionTable.OS -match "Windows"
 $BackendDir = Join-Path $ScriptDir "orchestrator"
 $FrontendDir = Join-Path $ScriptDir "orchestrator-ui"
-$VenvPython = Join-Path $BackendDir ".venv/bin/python"
-if (-not (Test-Path $VenvPython)) {
-    $VenvPython = Join-Path $BackendDir ".venv\Scripts\python.exe"
-}
+$VenvPython = Join-Path $BackendDir $(if ($isWin) { ".venv/Scripts/python.exe" } else { ".venv/bin/python" })
 $BackendScript = Join-Path $BackendDir "local_server.py"
 $BackendPort = 7071
 $FrontendPort = 5173
@@ -314,17 +313,12 @@ if (-not (Test-Path $VenvPython)) {
     exit 1
 }
 
-$venvVersion = & $VenvPython --version 2>&1
-if ($venvVersion -match "(\d+)\.(\d+)\.(\d+)") {
-    $venvMajor = [int]$Matches[1]
-    $venvMinor = [int]$Matches[2]
-    $maxVenvMinor = if ($IsWindows) { 13 } else { 14 }
-    if (-not ($venvMajor -eq 3 -and $venvMinor -ge 10 -and $venvMinor -le $maxVenvMinor)) {
-        $platformNote = if ($IsWindows) { "use Python 3.10-3.13 for Windows native dependency wheels" } else { "use Python 3.10-3.14 on macOS/Linux" }
-        Write-Host "  ✗ Backend venv uses Python $($Matches[0]); $platformNote" -ForegroundColor Red
-        Write-Host "    Fix: Remove-Item -Recurse -Force .\orchestrator\.venv; .\setup-prereqs.ps1" -ForegroundColor DarkGray
-        exit 1
-    }
+$venvRuntime = Get-PythonRuntimeInfo -File $VenvPython
+if (-not (Test-SupportedPythonRuntime -Runtime $venvRuntime -Windows $isWin)) {
+    $platformNote = if ($isWin) { "Python 3.13 x64 (AMD64), including x64 emulation on Windows 11 ARM64" } else { "Python 3.13-3.14 on macOS/Linux" }
+    Write-Host "  ✗ Backend venv is incompatible or unreadable; requires $platformNote" -ForegroundColor Red
+    Write-Host "    Fix: .\setup-prereqs.ps1" -ForegroundColor DarkGray
+    exit 1
 }
 
 # The venv can exist while dependencies are missing if setup-prereqs.ps1 was

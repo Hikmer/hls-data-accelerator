@@ -4,12 +4,20 @@ HDS is deployed automatically from Microsoft source. Do not create a Healthcare 
 
 ## Source and generated content
 
-- Immutable source: `vendor/microsoft-hds/1.4.0/HDS.SourceCode` and `DTT.SourceCode`
+- Vendored source and empty schema assets: `vendor/microsoft-hds/1.4.0/HDS.SourceCode` and `DTT.SourceCode`
 - Generated stage: `.hds-build/1.4.0`
 - Deployment entry point: `hds-source/Deploy-HdsSource.ps1`
 - Shared implementation: `orchestrator/activities/deploy_hds_source.py`
 
 The stage contains Microsoft build artifacts, one HDS wheel, one DTT wheel, patched deployment notebooks, and `environment.yml` with `scipy==1.11.4`.
+
+This distribution deliberately excludes Microsoft `SampleData`/`ReferenceData` datasets, nested Patient Outreach Analytics sample tables, sample FHIR/DICOM operation payloads, and saved notebook outputs. Populated claims files distributed as table schemas have been converted to zero-row Parquet with their schemas preserved; their Delta logs contain no sample statistics. Generator code, configurations, deployment artifacts, and schema-only Parquet remain available. Tools and integration scenarios that reference sample files require separately supplied data at their documented local paths. Those paths are ignored by Git and must not be force-added.
+
+The three DTT `configuration_compiler/config_files_models/env` modules are tracked source, including on case-insensitive filesystems. Python virtual-environment ignore rules do not exclude that runtime package.
+
+Staging validates every discovered runtime Python module and wheel `RECORD` entry. It rejects incomplete wheels and rebuilds an invalid cache. The source checksum includes vendored file contents; a source change or explicit force rebuild cannot reuse an old same-named wheel. Wheels retain distribution versions `hds==1.4.0` and `dtt==0.3.1.1271`, with deterministic content build tags in their filenames.
+
+The CMA and POA report definitions and themes are also tracked. Their `Reports/` directories are excluded from the generic coverage-output ignore rule, including when Git folds case. Missing report artifacts still fail Microsoft's original artifact manifest validation.
 
 ## Local validation
 
@@ -23,11 +31,11 @@ pwsh -NoProfile -File ./hds-source/Deploy-HdsSource.ps1 `
 `-ValidateOnly` makes no cloud calls. It verifies:
 
 - the Microsoft artifact validator manifest;
-- exact HDS and DTT wheel versions and cardinality;
+- exact HDS and DTT versions, one wheel per package, required runtime modules, `RECORD` integrity, and content build tags;
 - nine deployment notebooks and three validation notebooks;
 - managed lakehouse, config-notebook, and environment names;
 - `%run healthcare1_msft_config_notebook` references;
-- absence of `healthcare1_msft_environment` and unresolved adapter state.
+- absence of legacy config-notebook references and double-prefixed environment names.
 
 ## Automated deployment flow
 
@@ -92,11 +100,11 @@ The deployment wrapper never installs Python packages during a cloud run.
 
 ### Payload validation failure
 
-Delete `.hds-build/1.4.0` and rerun `-ValidateOnly`. Do not edit `vendor/`. If vendor integrity differs from the Microsoft download, restore the original source package first.
+Rerun `-ValidateOnly`; an invalid cached wheel or changed source triggers a rebuild. A missing DTT `env` package is a source-integrity error, not a Spark installation problem. Update to the repaired checkout rather than regenerating an incomplete wheel. Do not copy an entire Microsoft download over `vendor/`, because that can restore excluded datasets. Deployment-specific source patches belong in `.hds-build/1.4.0`.
 
 ### Environment publish failure
 
-Open `healthcare1_environment` in Fabric and inspect publish details. Resolve the reported library conflict, then rerun the same deployment. The source phase reuses the environment and reconciles its definitions.
+Open `healthcare1_msft_environment` in Fabric and inspect publish details. Resolve the reported library conflict, then rerun the same deployment. Reconciliation compares the published content-tagged HDS/DTT library names and published dependency YAML, not just version filenames or the last successful publish status. It uploads repaired wheels, removes obsolete managed HDS/DTT staging libraries while preserving unrelated libraries, publishes, and verifies the published payload. After updating an existing customer workspace, start a fresh Spark session before rerunning the failed POA pipeline. Local `-ValidateOnly` does not publish or repair an already deployed environment.
 
 ### Missing pipeline placeholders
 

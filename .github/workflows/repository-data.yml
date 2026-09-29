@@ -1,0 +1,45 @@
+name: Repository source integrity
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  source-only:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Install schema inspection dependency
+        run: python -m pip install --require-hashes --only-binary :all: -r utilities/repository-data-requirements.lock
+      - name: Reject bundled datasets and notebook results
+        run: python utilities/check_repository_data.py
+      - name: Exercise dataset protection boundaries
+        run: python -m unittest discover -s utilities/tests -v
+      - name: Generate canonical data from source in temporary directories
+        run: python -m unittest discover -s synthea/tests -v
+      - name: Install locked backend dependencies
+        run: python -m pip install --require-hashes --only-binary :all: -r orchestrator/requirements.lock
+      - name: Build and validate HDS from the clean checkout
+        working-directory: orchestrator
+        run: python -m activities.deploy_hds_source --workspace ci-source-integrity --validate-only
+      - name: Import the compiler environment model from the built wheel
+        working-directory: orchestrator
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import sys
+          wheel, = Path('../.hds-build').glob('*/hds-build-artifacts/healthcare-libraries/*/dtt-*.whl')
+          sys.path.insert(0, str(wheel.resolve()))
+          from configuration_compiler.config_files_models.env.ext_model import EnvConfigModel
+          model = EnvConfigModel.from_str('{"storage":{"secondary_lake":{"location":"Files/Secondary"}}}')
+          assert model.secondary_lake_location == 'Files/Secondary'
+          PY
+      - name: Exercise backend regressions
+        working-directory: orchestrator
+        run: python -m unittest discover -s tests -p 'test_*.py'

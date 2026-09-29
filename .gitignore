@@ -94,3 +94,37 @@ repo-overview-video/
 
 # Generated Microsoft HDS source-deployment stage
 .hds-build/
+
+# Local task context and generated synthetic cohorts
+.token-saver/
+synthea/.generated/
+synthea/prepackaged/
+synthea/output/
+canonical-fixture-manifest.json
+/output/
+
+# Downloaded datasets and generated record streams do not belong in source control.
+*.ndjson
+*.jsonl
+*.csv
+*.tsv
+*.dcm
+*.parquet
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+*.whl
+*.jar
+# HDS deployment requires schema-only Parquet assets; CI rejects populated files.
+!vendor/microsoft-hds/*/HDS.SourceCode/src/table_schemas/**/*.parquet
+!vendor/microsoft-hds/*/HDS.SourceCode/hds-build-artifacts/healthcare-tables/**/*.parquet
+vendor/microsoft-hds/*/SampleData/
+vendor/microsoft-hds/*/ReferenceData/
+vendor/microsoft-hds/*/HDS.SourceCode/SampleData/
+vendor/microsoft-hds/*/HDS.SourceCode/ReferenceData/
+vendor/microsoft-hds/*/HDS.SourceCode/src/tools/sampleData/PatientOutreachAnalytics/
+vendor/microsoft-hds/*/HDS.SourceCode/src/tools/fhirService/patient.json
+vendor/microsoft-hds/*/HDS.SourceCode/src/tools/fhirService/AllergyIntolerance.json
+vendor/microsoft-hds/*/HDS.SourceCode/src/tools/fhirService/Observation.json
+vendor/microsoft-hds/*/HDS.SourceCode/src/tools/fhirService/Procedure.json

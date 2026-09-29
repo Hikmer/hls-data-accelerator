@@ -209,7 +209,7 @@ def validate(root: Path) -> dict[str, Any]:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--root", type=Path, default=Path(__file__).resolve().parent)
+    parser.add_argument("--root", type=Path, default=Path(__file__).resolve().parent / ".generated")
     args = parser.parse_args()
     print(json.dumps(validate(args.root), indent=2))
 

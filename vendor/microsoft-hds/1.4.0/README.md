@@ -15,6 +15,12 @@ This package provides the source code and step-by-step deployment guides for the
 7. **Public Docs - Healthcare data solutions in Microsoft Fabric**: A PDF version of the publical documentation of the healthcare data solutions in Microsoft Fabric.
 8. **Transition Guide**: Use this document if you previously deployed the Microsoft-managed version of the healthcare data solutions in Microsoft Fabric in an existing workspace and you need to transition to the the source-code package available in the Microsoft Download Center.
 
+## Redistribution in HLS Data Accelerator
+
+The folder list above describes Microsoft's original download. This repository vendors its source and required deployment/schema assets without the bundled `SampleData` or `ReferenceData` datasets. Nested Patient Outreach Analytics sample tables, sample FHIR and DICOM operation files, and saved notebook outputs are also excluded. Claims Parquet assets containing sample rows have been emptied while preserving their schemas and updating Delta metadata. Source generators and configurations remain available; sample-driven tools require separately supplied local inputs. Do not commit those inputs or restore entire downloaded datasets into the source tree.
+
+The DTT `configuration_compiler/config_files_models/env` package is retained as runtime source, not treated as a Python virtual environment. Deployment-specific code patches are generated outside this directory under `.hds-build/1.4.0`.
+
 ## License
 
 Please refer to Microsoft license terms available here: https://go.microsoft.com/fwlink/?LinkId=2369925

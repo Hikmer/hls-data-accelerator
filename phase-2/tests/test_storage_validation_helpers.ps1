@@ -228,6 +228,27 @@ Assert-Equal -Expected 2 -Actual $script:SqlAttempts `
 Remove-Variable -Scope Script -Name LakehouseQueryExecutor -ErrorAction SilentlyContinue
 Remove-Item function:Start-Sleep -ErrorAction SilentlyContinue
 
+. (Join-Path $PSScriptRoot '../../utilities/python-runtime.ps1')
+$hlsRepoRoot = Join-Path ([IO.Path]::GetTempPath()) ('hls-missing-venv-' + [guid]::NewGuid().ToString('N'))
+$script:UnexpectedPythonCalls = 0
+function python { $script:UnexpectedPythonCalls++; $global:LASTEXITCODE = 0; '42' }
+$rejectedMissingRuntime = $false
+try {
+    Invoke-LakehouseScalarQuery -Server 'server' -Database 'database' -Token 'token' -Query 'SELECT 42' | Out-Null
+} catch {
+    $rejectedMissingRuntime = $true
+} finally {
+    Remove-Item function:python
+}
+Assert-Equal -Expected $true -Actual $rejectedMissingRuntime `
+    -Message 'SQL diagnostics must reject a missing managed interpreter.'
+Assert-Equal -Expected 0 -Actual $script:UnexpectedPythonCalls `
+    -Message 'SQL diagnostics must not fall back to an unrelated PATH interpreter.'
+Assert-Equal -Expected $false -Actual (Test-Path $hlsRepoRoot) `
+    -Message 'SQL diagnostics must not create a missing venv.'
+Assert-Equal -Expected $false -Actual (Test-Path Env:_HDS_SQL_TOKEN) `
+    -Message 'Interpreter selection failure must clear SQL credentials.'
+
 
 function Invoke-LakehouseScalarQuery {
     param(

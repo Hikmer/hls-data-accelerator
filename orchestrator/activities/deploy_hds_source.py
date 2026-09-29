@@ -13,6 +13,7 @@ import hashlib
 import io
 import json
 import logging
+import os
 import re
 import shutil
 import subprocess
@@ -23,6 +24,7 @@ import tempfile
 import zipfile
 from pathlib import Path
 from typing import Any, Callable
+from urllib.parse import quote
 
 import requests
 
@@ -35,7 +37,7 @@ logger = logging.getLogger(__name__)
 
 HDS_VERSION = "1.4.0"
 DTT_VERSION = "0.3.1.1271"
-STAGING_PATCH_VERSION = "2026-09-13.2"
+STAGING_PATCH_VERSION = "2026-09-29.2"
 COMPANY_PREFIX = "healthcare1"
 TECHNICAL_PREFIX = "msft"
 DEPLOYMENT_LAKEHOUSE = "deployment_lakehouse"
@@ -48,6 +50,15 @@ BOOTSTRAP_ROOT = HDS_ROOT / "src" / "tools" / "fabric_depolyment_notebooks"
 BUILD_ROOT = REPO_ROOT / ".hds-build" / HDS_VERSION
 ARTIFACT_ROOT_NAME = "hds-build-artifacts"
 LIBRARY_RELATIVE_PATH = Path("healthcare-libraries") / HDS_VERSION
+GENERATED_SOURCE_PATTERNS = (
+    "build", "dist", "*.egg-info", "__pycache__", "*.pyc", "*.pyo",
+    ".pytest_cache", ".mypy_cache", ".ruff_cache", ".venv", ".DS_Store",
+)
+DTT_ENV_MODULES = {
+    "configuration_compiler/config_files_models/env/__init__.py",
+    "configuration_compiler/config_files_models/env/ext_model.py",
+    "configuration_compiler/config_files_models/env/model.py",
+}
 VALIDATION_NOTEBOOK_NAMES = {
     "build_artifacts_validator.ipynb",
     "copy_sampledata.ipynb",
@@ -453,47 +464,128 @@ def _patch_dtt_optional_telemetry_import(source_root: Path) -> None:
     logging_path.write_text(source, encoding="utf-8")
 
 
-def _patch_dtt_wheel_optional_telemetry_import(wheel_path: Path) -> None:
-    """Apply the DTT telemetry lazy-import patch to a built or cached wheel."""
-    logging_member = "common/utils/logging.py"
-    record_member = f"dtt-{DTT_VERSION}.dist-info/RECORD"
-    with zipfile.ZipFile(wheel_path, "r") as archive:
-        infos = archive.infolist()
-        entries = {info.filename: archive.read(info.filename) for info in infos}
+def _runtime_modules(source_root: Path) -> set[str]:
+    """Mirror the regular-package discovery in the pinned HDS/DTT setup.py files."""
+    source = source_root / "src"
+    if source_root == DTT_ROOT:
+        missing = sorted(member for member in DTT_ENV_MODULES if not (source / member).is_file())
+        if missing:
+            raise ValueError(f"DTT source is missing required runtime modules: {missing}")
+    modules: set[str] = set()
+    for directory, children, files in os.walk(source):
+        children[:] = [
+            name for name in children
+            if not any(fnmatch.fnmatch(name, pattern) for pattern in GENERATED_SOURCE_PATTERNS)
+        ]
+        directory = Path(directory)
+        if directory == source:
+            continue
+        if "__init__.py" not in files or "." in directory.name:
+            children[:] = []
+            continue
+        relative = directory.relative_to(source)
+        # DTT setup.py includes only these four package trees; tests/tools are not wheels.
+        if source_root == DTT_ROOT and relative.parts[0] not in {
+            "common", "configuration_compiler", "dmf", "rmt",
+        }:
+            children[:] = []
+            continue
+        modules.update((relative / name).as_posix() for name in files if name.endswith(".py"))
+    if not modules:
+        raise ValueError(f"No runtime packages found under {source}")
+    if source_root == DTT_ROOT and not DTT_ENV_MODULES <= modules:
+        raise ValueError("DTT env runtime modules are not discoverable Python packages")
+    return modules
 
-    source = entries[logging_member].decode("utf-8")
-    source_lines = source.splitlines()
-    eager_import_line = "from azure.monitor.opentelemetry import configure_azure_monitor"
-    lazy_import_line = "            from azure.monitor.opentelemetry import configure_azure_monitor"
-    lazy_marker = "        if instrumentation_key and cls._app_insight_logger is None:\n"
-    if eager_import_line in source_lines:
-        if lazy_marker not in source:
-            raise ValueError("DTT wheel logging initialization no longer matches the expected contract")
-        source = source.replace(eager_import_line + "\n", "", 1)
-        source = source.replace(lazy_marker, lazy_marker + lazy_import_line + "\n\n", 1)
-    elif lazy_import_line not in source_lines:
-        raise ValueError("DTT wheel logging telemetry import does not match the expected contract")
-    patched_source = source.encode("utf-8")
-    entries[logging_member] = patched_source
 
-    record_rows = list(csv.reader(io.StringIO(entries[record_member].decode("utf-8"))))
-    digest = base64.urlsafe_b64encode(hashlib.sha256(patched_source).digest()).decode().rstrip("=")
-    for row in record_rows:
-        if row and row[0] == logging_member:
-            row[1] = f"sha256={digest}"
-            row[2] = str(len(patched_source))
-            break
-    else:
-        raise ValueError(f"DTT wheel RECORD is missing {logging_member}")
-    record_buffer = io.StringIO(newline="")
-    csv.writer(record_buffer, lineterminator="\n").writerows(record_rows)
-    entries[record_member] = record_buffer.getvalue().encode("utf-8")
+def _validate_runtime_wheel(wheel_path: Path, source_root: Path) -> None:
+    required = _runtime_modules(source_root)
+    with zipfile.ZipFile(wheel_path) as archive:
+        members = set(archive.namelist())
+        missing = sorted(required - members)
+        if missing:
+            raise ValueError(f"{wheel_path.name} is missing runtime modules: {missing}")
+        records = [name for name in members if name.endswith(".dist-info/RECORD")]
+        if len(records) != 1:
+            raise ValueError(f"{wheel_path.name} must contain one wheel RECORD")
+        rows = {
+            row[0]: row[1:]
+            for row in csv.reader(io.StringIO(archive.read(records[0]).decode("utf-8")))
+            if row
+        }
+        for member in sorted(members):
+            if member.endswith("/") or member in {records[0], records[0] + ".jws", records[0] + ".p7s"}:
+                continue
+            content = archive.read(member)
+            digest = base64.urlsafe_b64encode(hashlib.sha256(content).digest()).decode().rstrip("=")
+            if rows.get(member) != [f"sha256={digest}", str(len(content))]:
+                raise ValueError(f"{wheel_path.name} has an invalid RECORD entry for {member}")
 
-    temporary_wheel = wheel_path.with_suffix(".whl.tmp")
-    with zipfile.ZipFile(temporary_wheel, "w") as archive:
-        for info in infos:
-            archive.writestr(info, entries[info.filename])
-    temporary_wheel.replace(wheel_path)
+
+def _wheel_build_tag(entries: dict[str, bytes]) -> str:
+    """Hash installed contents, excluding self-referential RECORD and Build fields."""
+    digest = hashlib.sha256()
+    for name, content in sorted(entries.items()):
+        if name.endswith(".dist-info/RECORD"):
+            continue
+        if name.endswith(".dist-info/WHEEL"):
+            content = b"\n".join(line for line in content.splitlines() if not line.startswith(b"Build:")).rstrip(b"\n") + b"\n"
+        encoded_name = name.encode("utf-8")
+        digest.update(len(encoded_name).to_bytes(8, "big"))
+        digest.update(encoded_name)
+        digest.update(len(content).to_bytes(8, "big"))
+        digest.update(content)
+    # PEP 427 build tags start with a digit; the package version remains unchanged.
+    return "0h" + digest.hexdigest()
+
+
+def _tag_wheel(wheel_path: Path) -> Path:
+    """Produce a deterministic PEP 427 wheel whose filename identifies its contents."""
+    with zipfile.ZipFile(wheel_path) as archive:
+        entries = {name: archive.read(name) for name in archive.namelist() if not name.endswith("/")}
+    fields = wheel_path.stem.split("-")
+    if len(fields) not in {5, 6}:
+        raise ValueError(f"Invalid wheel filename: {wheel_path.name}")
+    metadata = f"{fields[0]}-{fields[1]}.dist-info/WHEEL"
+    record = f"{fields[0]}-{fields[1]}.dist-info/RECORD"
+    build_tag = _wheel_build_tag(entries)
+    entries[metadata] = b"\n".join(
+        line for line in entries[metadata].splitlines() if not line.startswith(b"Build:")
+    ).rstrip(b"\n") + f"\nBuild: {build_tag}\n".encode()
+    rows = io.StringIO(newline="")
+    writer = csv.writer(rows, lineterminator="\n")
+    for name, content in sorted(entries.items()):
+        if name == record:
+            continue
+        digest = base64.urlsafe_b64encode(hashlib.sha256(content).digest()).decode().rstrip("=")
+        writer.writerow([name, f"sha256={digest}", len(content)])
+    writer.writerow([record, "", ""])
+    entries[record] = rows.getvalue().encode()
+    tagged_path = wheel_path.with_name("-".join([*fields[:2], build_tag, *fields[-3:]]) + ".whl")
+    temporary_path = wheel_path.with_suffix(".whl.tmp")
+    with zipfile.ZipFile(temporary_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for name, content in sorted(entries.items()):
+            info = zipfile.ZipInfo(name, date_time=(1980, 1, 1, 0, 0, 0))
+            info.create_system = 3
+            info.external_attr = 0o100644 << 16
+            info.compress_type = zipfile.ZIP_DEFLATED
+            archive.writestr(info, content)
+    temporary_path.replace(tagged_path)
+    if tagged_path != wheel_path:
+        wheel_path.unlink()
+    return tagged_path
+
+
+def _validate_wheel_identity(wheel_path: Path) -> None:
+    with zipfile.ZipFile(wheel_path) as archive:
+        entries = {name: archive.read(name) for name in archive.namelist() if not name.endswith("/")}
+    fields = wheel_path.stem.split("-")
+    build_tag = _wheel_build_tag(entries)
+    if len(fields) != 6 or fields[2] != build_tag:
+        raise ValueError(f"Wheel filename does not identify its content: {wheel_path.name}")
+    metadata = entries[f"{fields[0]}-{fields[1]}.dist-info/WHEEL"]
+    if [line for line in metadata.splitlines() if line.startswith(b"Build:")] != [f"Build: {build_tag}".encode()]:
+        raise ValueError(f"Wheel Build metadata does not match its filename: {wheel_path.name}")
 
 
 def _build_wheel(source_root: Path, destination: Path, expected: str) -> Path:
@@ -503,19 +595,20 @@ def _build_wheel(source_root: Path, destination: Path, expected: str) -> Path:
         shutil.copytree(
             source_root,
             build_source,
-            ignore=shutil.ignore_patterns("build", "*.egg-info", "__pycache__", "*.pyc"),
+            ignore=shutil.ignore_patterns(*GENERATED_SOURCE_PATTERNS),
         )
         if source_root == DTT_ROOT:
             _patch_dtt_optional_telemetry_import(build_source)
         subprocess.run(
-            [sys.executable, "-m", "pip", "wheel", "--no-deps", "--wheel-dir", str(destination), str(build_source)],
+            [sys.executable, "-m", "pip", "wheel", "--no-deps", "--no-cache-dir", "--wheel-dir", str(destination), str(build_source)],
             check=True,
         )
     created = set(destination.glob("*.whl")) - before
     matches = [path for path in created if fnmatch.fnmatch(path.name.lower(), expected.lower())]
     if len(matches) != 1:
         raise ValueError(f"Expected exactly one newly built {expected}, found {[p.name for p in matches]}")
-    return matches[0]
+    _validate_runtime_wheel(matches[0], source_root)
+    return _tag_wheel(matches[0])
 
 
 def _validate_expected_tree(root: Path, spec: dict[str, Any], relative: Path = Path()) -> None:
@@ -536,10 +629,18 @@ def _source_checksum() -> str:
     digest = hashlib.sha256()
     digest.update(STAGING_PATCH_VERSION.encode())
     for root in (HDS_ROOT, DTT_ROOT):
-        for path in sorted(item for item in root.rglob("*") if item.is_file()):
-            digest.update(path.relative_to(VENDOR_ROOT).as_posix().encode())
-            digest.update(path.stat().st_size.to_bytes(8, "big"))
-            digest.update(path.read_bytes())
+        for directory, children, files in os.walk(root):
+            children[:] = sorted(
+                name for name in children
+                if not any(fnmatch.fnmatch(name, pattern) for pattern in GENERATED_SOURCE_PATTERNS)
+            )
+            for name in sorted(files):
+                if any(fnmatch.fnmatch(name, pattern) for pattern in GENERATED_SOURCE_PATTERNS):
+                    continue
+                path = Path(directory) / name
+                digest.update(path.relative_to(VENDOR_ROOT).as_posix().encode())
+                digest.update(path.stat().st_size.to_bytes(8, "big"))
+                digest.update(path.read_bytes())
     return digest.hexdigest()
 
 
@@ -547,16 +648,17 @@ def stage_source_payload(force: bool = False) -> Path:
     """Build wheels and patched bootstrap/runtime notebooks outside vendor/."""
     if not HDS_ROOT.is_dir() or not DTT_ROOT.is_dir():
         raise FileNotFoundError(f"Vendored HDS/DTT source missing under {VENDOR_ROOT}")
+    _runtime_modules(HDS_ROOT)
+    _runtime_modules(DTT_ROOT)
     checksum = _source_checksum()
     marker = BUILD_ROOT / ".source-checksum"
     if not force and marker.exists() and marker.read_text().strip() == checksum:
-        validate_staged_payload(BUILD_ROOT)
-        return BUILD_ROOT
-
-    cached_wheels: dict[str, bytes] = {}
-    cached_library_root = BUILD_ROOT / ARTIFACT_ROOT_NAME / LIBRARY_RELATIVE_PATH
-    if cached_library_root.is_dir():
-        cached_wheels = {path.name: path.read_bytes() for path in cached_library_root.glob("*.whl")}
+        try:
+            validate_staged_payload(BUILD_ROOT)
+        except (ValueError, FileNotFoundError, KeyError, zipfile.BadZipFile) as exc:
+            logger.warning("Rebuilding invalid HDS source cache: %s", exc)
+        else:
+            return BUILD_ROOT
 
     if BUILD_ROOT.exists():
         shutil.rmtree(BUILD_ROOT)
@@ -581,17 +683,10 @@ def stage_source_payload(force: bool = False) -> Path:
         (DTT_ROOT, f"dtt-{DTT_VERSION}-*.whl"),
     )
     for source_root, expected in wheel_specs:
-        cached_matches = [name for name in cached_wheels if fnmatch.fnmatch(name.lower(), expected.lower())]
-        if len(cached_matches) > 1:
-            raise ValueError(f"Expected at most one cached {expected}, found {cached_matches}")
-        if cached_matches:
-            cached_name = cached_matches[0]
-            wheel_path = library_destination / cached_name
-            wheel_path.write_bytes(cached_wheels[cached_name])
-        else:
-            wheel_path = _build_wheel(source_root, library_destination, expected)
-        if source_root == DTT_ROOT:
-            _patch_dtt_wheel_optional_telemetry_import(wheel_path)
+        # Never retain same-name wheels after source changes or an explicit force rebuild.
+        for old_wheel in library_destination.glob(expected):
+            old_wheel.unlink()
+        _build_wheel(source_root, library_destination, expected)
 
     environment_yml = library_destination / "environment.yml"
     environment_text = environment_yml.read_text(encoding="utf-8")
@@ -619,9 +714,8 @@ def stage_source_payload(force: bool = False) -> Path:
     for source in sorted(artifact_destination.rglob("*.ipynb")):
         patch_notebook(source, source)
 
-    marker.parent.mkdir(parents=True, exist_ok=True)
-    marker.write_text(checksum, encoding="utf-8")
     validate_staged_payload(BUILD_ROOT)
+    marker.write_text(checksum, encoding="utf-8")
     return BUILD_ROOT
 
 
@@ -632,6 +726,10 @@ def validate_staged_payload(build_root: Path) -> dict[str, Any]:
     dtt_wheels = list(library_root.glob(f"dtt-{DTT_VERSION}-*.whl"))
     if len(hds_wheels) != 1 or len(dtt_wheels) != 1:
         raise ValueError(f"Expected one HDS and one DTT wheel, found {hds_wheels} / {dtt_wheels}")
+    _validate_runtime_wheel(hds_wheels[0], HDS_ROOT)
+    _validate_runtime_wheel(dtt_wheels[0], DTT_ROOT)
+    _validate_wheel_identity(hds_wheels[0])
+    _validate_wheel_identity(dtt_wheels[0])
     with zipfile.ZipFile(dtt_wheels[0], "r") as archive:
         dtt_logging = archive.read("common/utils/logging.py").decode("utf-8")
     eager_telemetry_import = "from azure.monitor.opentelemetry import configure_azure_monitor"
@@ -810,6 +908,53 @@ def validate_source_contract(
         raise RuntimeError(f"HDS source contract incomplete: {json.dumps(missing, sort_keys=True)}")
     return {"expected": {key: len(value) for key, value in expected.items()}, "environment_id": environment["id"], "master_status": master_job.get("status")}
 
+def _environment_custom_libraries(fabric: FabricClient, endpoint: str) -> set[str]:
+    names: set[str] = set()
+    page_endpoint = f"{endpoint}?beta=false"
+    while True:
+        page = fabric.call("GET", page_endpoint)
+        names.update(item["name"] for item in page["libraries"] if item["libraryType"] == "Custom")
+        token = page.get("continuationToken")
+        if not token or token == "null":
+            return names
+        page_endpoint = f"{endpoint}?beta=false&continuationToken={quote(token, safe='')}"
+
+
+def _managed_wheel_names(names: set[str]) -> set[str]:
+    return {name for name in names if name.endswith(".whl") and name.split("-", 1)[0].lower() in {"hds", "dtt"}}
+
+
+def _environment_payload_matches(
+    fabric: FabricClient,
+    workspace_id: str,
+    environment_id: str,
+    desired_hashes: dict[str, str],
+) -> bool:
+    """Use published content-tagged names and YAML; definition bytes are an extra check."""
+    published_wheels = _environment_custom_libraries(
+        fabric, f"/workspaces/{workspace_id}/environments/{environment_id}/libraries",
+    )
+    required_wheels = {Path(path).name for path in desired_hashes if path.endswith(".whl")}
+    if _managed_wheel_names(published_wheels) != required_wheels:
+        return False
+    published_yml = fabric.request_raw(
+        "GET", f"/workspaces/{workspace_id}/environments/{environment_id}/libraries/exportExternalLibraries",
+    ).content
+    if hashlib.sha256(published_yml).hexdigest() != desired_hashes["Libraries/PublicLibraries/environment.yml"]:
+        return False
+    definition = fabric.get_item_definition(workspace_id, environment_id)
+    published_hashes = {}
+    for part in definition["parts"]:
+        path = part["path"]
+        if path not in desired_hashes:
+            continue
+        if path in published_hashes or part["payloadType"] != "InlineBase64":
+            raise ValueError(f"Invalid environment definition part: {path}")
+        content = base64.b64decode(part["payload"], validate=True)
+        published_hashes[path] = hashlib.sha256(content).hexdigest()
+    return published_hashes == desired_hashes
+
+
 def _deploy_environment(
     fabric: FabricClient,
     workspace_id: str,
@@ -834,10 +979,19 @@ def _deploy_environment(
     wheel_paths = sorted(library_root.glob("*.whl"))
     if not wheel_paths:
         raise FileNotFoundError(f"No HDS environment wheels found under {library_root}")
+    for wheel_path in wheel_paths:
+        _validate_wheel_identity(wheel_path)
     environment_yml = library_root / "environment.yml"
     if not environment_yml.is_file():
         raise FileNotFoundError(f"HDS environment definition not found: {environment_yml}")
     desired_environment_yml = environment_yml.read_text(encoding="utf-8")
+    desired_hashes = {
+        f"Libraries/CustomLibraries/{path.name}": hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in wheel_paths
+    }
+    desired_hashes["Libraries/PublicLibraries/environment.yml"] = hashlib.sha256(
+        desired_environment_yml.encode("utf-8")
+    ).hexdigest()
 
     try:
         details = fabric.call("GET", base_endpoint)
@@ -858,22 +1012,17 @@ def _deploy_environment(
         environment_id = str(environment["id"])
         base_endpoint = f"/workspaces/{workspace_id}/environments/{environment_id}"
         details = environment
-    try:
-        staging = fabric.call("GET", f"{base_endpoint}/staging/libraries")
-    except requests.HTTPError as exc:
-        if exc.response is None or exc.response.status_code != 404:
-            raise
-        staging = {}
-    staged_wheels = set((staging.get("customLibraries") or {}).get("wheelFiles") or [])
     required_wheels = {path.name for path in wheel_paths}
-    staged_environment_yml = str(staging.get("environmentYml") or "")
     published_state = str((details.get("properties", {}).get("publishDetails") or {}).get("state") or "")
-    environment_definition_current = staged_environment_yml.strip() == desired_environment_yml.strip()
-    if published_state.lower() == "success" and required_wheels <= staged_wheels and environment_definition_current:
+    if published_state.lower() == "success" and _environment_payload_matches(
+        fabric, workspace_id, environment_id, desired_hashes,
+    ):
         _event("environment", "succeeded", f"Environment already published: {environment_id}")
         return details
 
     _event("environment", "running", f"Staging {len(wheel_paths)} Microsoft HDS/DTT wheels")
+    staged_wheels = _environment_custom_libraries(fabric, f"{base_endpoint}/staging/libraries")
+    obsolete_wheels = _managed_wheel_names(staged_wheels) - required_wheels
     for wheel_path in wheel_paths:
         fabric.request_content(
             "POST",
@@ -881,6 +1030,8 @@ def _deploy_environment(
             wheel_path.read_bytes(),
             max_retries=60,
         )
+    for name in sorted(obsolete_wheels):
+        fabric.request_raw("DELETE", f"{base_endpoint}/staging/libraries/{quote(name, safe='')}")
     fabric.request_content(
         "POST",
         f"{base_endpoint}/staging/libraries/importExternalLibraries",
@@ -889,16 +1040,18 @@ def _deploy_environment(
     )
     verify_deadline = time.time() + (10 * 60)
     while True:
-        staging = fabric.call("GET", f"{base_endpoint}/staging/libraries")
-        staged_wheels = set((staging.get("customLibraries") or {}).get("wheelFiles") or [])
+        staged_wheels = _environment_custom_libraries(fabric, f"{base_endpoint}/staging/libraries")
         missing_wheels = required_wheels - staged_wheels
-        if not missing_wheels:
+        remaining_obsolete = _managed_wheel_names(staged_wheels) - required_wheels
+        if not missing_wheels and not remaining_obsolete:
             break
         if time.time() >= verify_deadline:
-            raise RuntimeError(f"Environment wheel staging validation failed: {sorted(missing_wheels)}")
+            raise RuntimeError(f"Environment wheel staging validation failed: missing={sorted(missing_wheels)}, obsolete={sorted(remaining_obsolete)}")
         time.sleep(10)
 
-    fabric.request_raw("POST", f"{base_endpoint}/staging/publish")
+    publish_response = fabric.request_raw("POST", f"{base_endpoint}/staging/publish?beta=false")
+    if publish_response.status_code == 202:
+        fabric._poll_lro(publish_response, timeout_seconds=75 * 60)
     deadline = time.time() + (75 * 60)
     last_emit = -60
     started_at = time.time()
@@ -912,6 +1065,8 @@ def _deploy_environment(
             _event("environment", "running", f"Environment publish is {state}; elapsed {minutes}m {seconds}s")
             last_emit = elapsed
         if state.lower() in {"success", "succeeded", "published", "active"}:
+            if not _environment_payload_matches(fabric, workspace_id, environment_id, desired_hashes):
+                raise RuntimeError(f"Published environment content does not match the staged payload: {environment_id}")
             _event("environment", "succeeded", f"Environment published: {environment_id}")
             return details
         if state.lower() in {"failed", "cancelled", "canceled"}:

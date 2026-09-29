@@ -1,6 +1,6 @@
 // orchestrator-infra.bicep
 // Deploys the Deployment Orchestrator infrastructure:
-//   - Azure Function App (Flex Consumption, Python 3.11) for Durable Functions backend
+//   - Azure Function App (Flex Consumption, Python 3.13) for Durable Functions backend
 //   - Azure Static Web App for React SPA frontend
 //   - Storage Account for Durable Functions state (task hub)
 //   - Application Insights for monitoring
@@ -94,8 +94,8 @@ resource functionApp 'Microsoft.Web/sites@2023-12-01' = {
     serverFarmId: hostingPlan.id
     httpsOnly: true
     siteConfig: {
-      pythonVersion: '3.11'
-      linuxFxVersion: 'PYTHON|3.11'
+      pythonVersion: '3.13'
+      linuxFxVersion: 'PYTHON|3.13'
       appSettings: [
         { name: 'AzureWebJobsStorage__accountName', value: storageAccount.name }
         { name: 'AzureWebJobsStorage__credential', value: 'managedidentity' }

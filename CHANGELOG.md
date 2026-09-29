@@ -2,6 +2,15 @@
 
 ## [Unreleased] — May 28, 2026
 
+### Windows ARM and source-only HDS deployment (2026-09-29)
+
+- Restored the three original DTT `configuration_compiler/config_files_models/env` source files and corrected case-insensitive ignore rules. Clean-checkout wheel builds now reject missing runtime modules or invalid `RECORD` entries.
+- Made wheel caches depend on source contents and added deterministic content build tags without changing HDS/DTT distribution versions. Fabric environment reconciliation now detects same-version repairs against published libraries and dependency YAML, removes obsolete managed wheels, and republishes changed content.
+- Standardized Windows on Python 3.13 x64, including Windows 11 ARM64 emulation, with interpreter-level checks throughout bootstrap, preflight, launch, and deployment. Added Windows-conditional dependency hashes and aligned the existing Flex Consumption Python runtime with 3.13. macOS/Linux support Python 3.13–3.14.
+- Removed bundled Synthea patients and Microsoft sample datasets, cleared saved notebook outputs, and converted populated claims schema assets to empty Parquet without changing their schemas. Canonical 100-patient data is generated and validated locally before upload; reuse and infrastructure-only modes do not silently generate replacement data.
+- Added ignored data destinations, a pre-push check of outgoing commit contents, and a source-only CI gate. Development-only PyArrow inspects Parquet row metadata so required empty schemas remain tracked while populated files are rejected.
+- Restored six required CMA/POA report-definition and theme files that the nested `reports/` coverage exclusion hid on case-insensitive filesystems. The original Microsoft artifact manifest is enforced without removing these requirements.
+
 ### Health Command Center Fabric App
 - **Added** [`rayfin-health-command-center/`](rayfin-health-command-center/), a Rayfin Fabric App that serves payer, provider, and medtech operations from one surface. A controlled sync reads the Direct Lake models over `healthcare1_reporting_gold`, masks identifiers, and writes the app's own MSSQL snapshot; the dashboard renders from that database rather than querying a model on every mount.
 - **Added** three lenses over the shared Gold layer: payer claims economics with collection/denial rates, PMPM, revenue at risk and the highest-cost members; provider quality with open care gaps, RAF, readmission risk tiers and a CMS Stars gauge; and medtech imaging throughput with modality mix and DICOM instance volume.

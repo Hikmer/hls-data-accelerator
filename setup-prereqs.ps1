@@ -23,6 +23,7 @@ param(
 
 $ErrorActionPreference = "Continue"
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+. (Join-Path $ScriptDir "utilities/python-runtime.ps1")
 
 Write-Host ""
 Write-Host "+============================================================+" -ForegroundColor Cyan
@@ -173,56 +174,62 @@ if ($azMod) {
     }
 }
 
-# ── 5. Python 3.10-3.13 on Windows, 3.10-3.14 elsewhere ───────────────
+# ── 5. Python 3.13 x64 on Windows, 3.13-3.14 elsewhere ───────────────
 Write-Host ""
 Write-Host "  Checking Python + Node.js..." -ForegroundColor White
 $hasPython = $false
 $pythonFile = $null
-$pythonArgs = @()
-$pythonLabel = $null
-$pythonCandidates = if ($isWin) {
-    @(
-        @{ File = "py"; Args = @("-3.13") },
-        @{ File = "py"; Args = @("-3.12") },
-        @{ File = "py"; Args = @("-3.11") },
-        @{ File = "py"; Args = @("-3.10") },
-        @{ File = "python"; Args = @() }
-    )
-} else {
-    @(
-        @{ File = "python3.14"; Args = @() },
-        @{ File = "python3.13"; Args = @() },
-        @{ File = "python3.12"; Args = @() },
-        @{ File = "python3.11"; Args = @() },
-        @{ File = "python3.10"; Args = @() },
-        @{ File = "python3"; Args = @() },
-        @{ File = "python"; Args = @() }
-    )
+$pythonSupport = if ($isWin) { "Python 3.13 x64 (AMD64)" } else { "Python 3.13-3.14" }
+function Get-PythonCandidates {
+    if ($isWin) {
+        # Explicit x64 selectors cover the legacy launcher and the install manager.
+        foreach ($selector in @("-V:3.13-64", "-3.13-64", "-V:3.13")) {
+            @{ File = "py"; Args = @($selector) }
+        }
+        # Both launchers support -0p. Probe every registered path, including x64
+        # installs hidden by a same-version ARM64 default. Listing never installs.
+        if (Get-Command py -ErrorAction SilentlyContinue) {
+            $registered = & py -0p 2>$null
+            if ($LASTEXITCODE -eq 0) {
+                foreach ($line in $registered) {
+                    if ($line -match '^\s*-\S+\s+(?:\*\s+)?(.+?\.exe)\s*$') {
+                        @{ File = $Matches[1].Trim('"'); Args = @() }
+                    }
+                }
+            }
+        }
+    }
+    $names = if ($isWin) {
+        @("python3.13", "python", "python3")
+    } else {
+        @("python3.14", "python3.13", "python3", "python")
+    }
+    foreach ($name in $names) {
+        # Do not let an earlier PATH entry hide a compatible later executable.
+        foreach ($command in @(Get-Command $name -All -CommandType Application -ErrorAction SilentlyContinue)) {
+            @{ File = $command.Source; Args = @() }
+        }
+    }
 }
 
 function Select-SupportedPython {
-    foreach ($candidate in $pythonCandidates) {
+    $script:hasPython = $false
+    $script:pythonFile = $null
+    foreach ($candidate in @(Get-PythonCandidates)) {
         if (-not (Get-Command $candidate.File -ErrorAction SilentlyContinue)) { continue }
-        $candidateArgs = @($candidate.Args)
-        $candidateLabel = ($candidate.File + " " + ($candidateArgs -join " ")).Trim()
-        $pyVer = & $candidate.File @candidateArgs --version 2>&1
-        if ($LASTEXITCODE -ne 0) { continue }
-        if ($pyVer -match "(\d+)\.(\d+)\.(\d+)") {
-            $major = [int]$Matches[1]; $minor = [int]$Matches[2]
-            $maxMinor = if ($isWin) { 13 } else { 14 }
-            if ($major -eq 3 -and $minor -ge 10 -and $minor -le $maxMinor) {
-                Write-Host "  ✓ Python $($Matches[0]) via $candidateLabel" -ForegroundColor Green
-                $script:pass++
-                $script:hasPython = $true
-                $script:pythonFile = $candidate.File
-                $script:pythonArgs = $candidateArgs
-                $script:pythonLabel = $candidateLabel
-                return $true
-            }
-            if ($isWin -and $major -eq 3 -and $minor -ge 14) {
-                Write-Host "  ⚠ Python $($Matches[0]) via $candidateLabel is too new for Windows native dependencies" -ForegroundColor Yellow
-                $script:warn++
-            }
+        $candidateLabel = ($candidate.File + " " + ($candidate.Args -join " ")).Trim()
+        $runtime = Get-PythonRuntimeInfo -File $candidate.File -Arguments $candidate.Args
+        if (Test-SupportedPythonRuntime -Runtime $runtime -Windows $isWin) {
+            Write-Host "  ✓ Python $($runtime.version -join '.') ($($runtime.platform), $($runtime.bits)-bit) via $candidateLabel" -ForegroundColor Green
+            $script:pass++
+            $script:hasPython = $true
+            # Use the verified executable directly, not a launcher default that can change.
+            $script:pythonFile = $runtime.executable
+            return $true
+        }
+        if ($runtime) {
+            Write-Host "  ⚠ Rejecting Python $($runtime.version -join '.') ($($runtime.platform), $($runtime.bits)-bit) via $candidateLabel; requires $pythonSupport" -ForegroundColor Yellow
+            $script:warn++
         }
     }
     return $false
@@ -233,27 +240,30 @@ Select-SupportedPython | Out-Null
 if (-not $hasPython -and $isWin -and -not $CheckOnly) {
     $wingetCmd = Get-Command winget -ErrorAction SilentlyContinue
     if ($wingetCmd) {
-        Write-Host "  ⚙ Installing Python 3.13 with winget..." -ForegroundColor Yellow
-        winget install --id Python.Python.3.13 -e --accept-package-agreements --accept-source-agreements
+        Write-Host "  ⚙ Installing Python 3.13 x64 with winget (Windows 11 ARM64 supports x64 emulation)..." -ForegroundColor Yellow
+        winget install --id Python.Python.3.13 -e --architecture x64 --accept-package-agreements --accept-source-agreements
         if ($LASTEXITCODE -eq 0) {
             $installed++
-            # The Python launcher may be available immediately even if PATH is not refreshed.
+            # Refresh only this process's PATH from registered environment values.
+            $env:PATH = @($env:PATH, [Environment]::GetEnvironmentVariable("Path", "Machine"), [Environment]::GetEnvironmentVariable("Path", "User")) -join [IO.Path]::PathSeparator
             Select-SupportedPython | Out-Null
         } else {
-            Write-Host "  ✗ Python 3.13 winget install failed" -ForegroundColor Red
+            Write-Host "  ✗ Python 3.13 x64 winget install failed; x64 Python requires an x64-capable Windows host (Windows 11 on ARM)." -ForegroundColor Red
             $fail++
         }
     } else {
-        Write-Host "  ✗ Python 3.10-3.13 — not found and winget is unavailable" -ForegroundColor Red
+        Write-Host "  ✗ $pythonSupport — not found and winget is unavailable" -ForegroundColor Red
         Write-Host "    Install: https://www.python.org/downloads/windows/" -ForegroundColor DarkGray
         $fail++
     }
 }
 
 if (-not $hasPython) {
-    Write-Host "  ✗ Python 3.10-3.13 — not found" -ForegroundColor Red
-    Write-Host "    Python 3.14+ is not supported here yet: cryptography may build from source and require Visual Studio C++ link.exe on Windows ARM64." -ForegroundColor DarkGray
-    Write-Host "    Install: winget install --id Python.Python.3.13 -e --accept-package-agreements --accept-source-agreements" -ForegroundColor DarkGray
+    Write-Host "  ✗ $pythonSupport — not found" -ForegroundColor Red
+    if ($isWin) {
+        Write-Host "    ARM64 and x86 Python are not supported. cryptography is binary-only; C++ build tools cannot supply the required x64 wheel." -ForegroundColor DarkGray
+        Write-Host "    Install: winget install --id Python.Python.3.13 -e --architecture x64 --accept-package-agreements --accept-source-agreements" -ForegroundColor DarkGray
+    }
     $fail++
 }
 
@@ -320,104 +330,72 @@ Write-Host ""
 Write-Host "  Setting up Orchestrator backend..." -ForegroundColor White
 $venvPath = Join-Path $ScriptDir "orchestrator/.venv"
 $requirementsPath = Join-Path $ScriptDir "orchestrator/requirements.lock"
+$dataGuardRequirementsPath = Join-Path $ScriptDir "utilities/repository-data-requirements.lock"
 
-if ($hasPython) {
-    $venvPython = if ($isWin) { Join-Path $venvPath "Scripts/python.exe" } else { Join-Path $venvPath "bin/python" }
-    $venvNeedsRecreate = $false
-
-    if (Test-Path $venvPython) {
-        $venvVer = & $venvPython --version 2>&1
-        if ($venvVer -match "(\d+)\.(\d+)\.(\d+)") {
-            $venvMajor = [int]$Matches[1]; $venvMinor = [int]$Matches[2]
-            $maxVenvMinor = if ($isWin) { 13 } else { 14 }
-            if (-not ($venvMajor -eq 3 -and $venvMinor -ge 10 -and $venvMinor -le $maxVenvMinor)) {
-                Write-Host "  ⚠ Existing venv uses Python $($Matches[0]); recreating with $pythonLabel" -ForegroundColor Yellow
-                $warn++
-                $venvNeedsRecreate = $true
-            } else {
-                Write-Host "  ✓ Python venv exists (orchestrator/.venv, Python $($Matches[0]))" -ForegroundColor Green
-                $pass++
-            }
-        } else {
-            Write-Host "  ⚠ Existing venv Python version unreadable; recreating with $pythonLabel" -ForegroundColor Yellow
-            $warn++
-            $venvNeedsRecreate = $true
-        }
-    } elseif (Test-Path $venvPath) {
-        Write-Host "  ⚠ Python venv folder exists but interpreter is missing; recreating with $pythonLabel" -ForegroundColor Yellow
-        $warn++
-        $venvNeedsRecreate = $true
-    }
-
-    if ($venvNeedsRecreate) {
-        if ($CheckOnly) {
-            Write-Host "  ✗ Python venv must be recreated" -ForegroundColor Red
-            Write-Host "    Fix: Remove-Item -Recurse -Force .\orchestrator\.venv; .\setup-prereqs.ps1" -ForegroundColor DarkGray
-            $fail++
-        } else {
-            Remove-Item -Recurse -Force $venvPath -ErrorAction SilentlyContinue
-        }
-    }
-
-    if (-not (Test-Path $venvPath) -and -not $CheckOnly) {
-        Write-Host "  ⚙ Creating Python virtual environment with $pythonLabel..." -ForegroundColor Yellow
-        & $pythonFile @pythonArgs -m venv $venvPath
+$venvRuntime = Initialize-PythonVenv -Path $venvPath -PythonFile $pythonFile -Windows $isWin -CheckOnly:$CheckOnly
+if (-not $venvRuntime) {
+    Write-Host "  ✗ Backend venv is missing or incompatible; requires $pythonSupport" -ForegroundColor Red
+    Write-Host "    Fix: .\setup-prereqs.ps1" -ForegroundColor DarkGray
+    $fail++
+} else {
+    $venvPython = $venvRuntime.executable
+    Write-Host "  ✓ Python venv (Python $($venvRuntime.version -join '.'), $($venvRuntime.platform), $($venvRuntime.bits)-bit)" -ForegroundColor Green
+    $pass++
+    # Only a successfully probed, compatible venv may reach pip or import checks.
+    if (-not $CheckOnly) {
+        Write-Host "  ⚙ Installing Python dependencies..." -ForegroundColor Yellow
+        & $venvPython -m pip install --upgrade pip
         if ($LASTEXITCODE -ne 0) {
-            Write-Host "  ✗ Python virtual environment creation failed" -ForegroundColor Red
+            Write-Host "  ✗ pip upgrade failed" -ForegroundColor Red
             $fail++
         } else {
-            $installed++
-            Write-Host "  ✓ Virtual environment created at orchestrator/.venv" -ForegroundColor Green
-        }
-    } elseif (-not (Test-Path $venvPath) -and $CheckOnly) {
-        Write-Host "  ✗ Python venv not created (orchestrator/.venv)" -ForegroundColor Yellow
-        $warn++
-    }
-
-    # Install/verify Python dependencies using the venv interpreter. Do not hide
-    # pip failures: a partial/stale venv is worse than no venv because Start-WebUI
-    # will find it and then fail later with ModuleNotFoundError.
-    if (Test-Path $venvPath) {
-        $venvPython = if ($isWin) { Join-Path $venvPath "Scripts/python.exe" } else { Join-Path $venvPath "bin/python" }
-        if (-not (Test-Path $venvPython)) {
-            Write-Host "  ✗ Python venv interpreter missing at $venvPython" -ForegroundColor Red
-            $fail++
-        } elseif (-not $CheckOnly) {
-            Write-Host "  ⚙ Installing Python dependencies..." -ForegroundColor Yellow
-            & $venvPython -m pip install --upgrade pip
+            & $venvPython -m pip install --no-cache-dir --require-hashes --only-binary "cryptography,pyarrow" -r $requirementsPath -r $dataGuardRequirementsPath
             if ($LASTEXITCODE -ne 0) {
-                Write-Host "  ✗ pip upgrade failed" -ForegroundColor Red
+                Write-Host "  ✗ Python dependency install failed" -ForegroundColor Red
+                Write-Host "    Retry: $venvPython -m pip install --no-cache-dir --require-hashes --only-binary cryptography,pyarrow -r $requirementsPath -r $dataGuardRequirementsPath" -ForegroundColor DarkGray
+                Write-Host "    cryptography and pyarrow require wheels; on Windows use Python 3.13 x64, including x64 emulation on Windows 11 ARM64." -ForegroundColor DarkGray
                 $fail++
             } else {
-                & $venvPython -m pip install --no-cache-dir --require-hashes --only-binary cryptography -r $requirementsPath
+                & $venvPython -c "import fastapi, uvicorn, pydantic, pyarrow"
                 if ($LASTEXITCODE -ne 0) {
-                    Write-Host "  ✗ Python dependency install failed" -ForegroundColor Red
-                    Write-Host "    Retry: $venvPython -m pip install --no-cache-dir --require-hashes --only-binary cryptography -r $requirementsPath" -ForegroundColor DarkGray
-                    Write-Host "    If cryptography still tries to build from source, install Visual Studio Build Tools with the C++ workload or use Windows x64 Python under emulation." -ForegroundColor DarkGray
+                    Write-Host "  Python dependency verification failed (fastapi/uvicorn/pydantic/pyarrow import)" -ForegroundColor Red
                     $fail++
                 } else {
-                    & $venvPython -c "import fastapi, uvicorn, pydantic"
-                    if ($LASTEXITCODE -ne 0) {
-                        Write-Host "  ✗ Python dependency verification failed (fastapi/uvicorn/pydantic import)" -ForegroundColor Red
-                        $fail++
-                    } else {
-                        $installed++
-                        Write-Host "  ✓ Python dependencies installed and verified" -ForegroundColor Green
-                        $pass++
-                    }
+                    $installed++
+                    Write-Host "  ✓ Python dependencies installed and verified" -ForegroundColor Green
+                    $pass++
                 }
             }
-        } else {
-            & $venvPython -c "import fastapi, uvicorn, pydantic" 2>$null
-            if ($LASTEXITCODE -eq 0) {
-                Write-Host "  ✓ Python dependencies present" -ForegroundColor Green
-                $pass++
-            } else {
-                Write-Host "  ✗ Python dependencies missing from orchestrator/.venv" -ForegroundColor Red
-                Write-Host "    Fix: $venvPython -m pip install --no-cache-dir --require-hashes --only-binary cryptography -r $requirementsPath" -ForegroundColor DarkGray
-                $fail++
-            }
         }
+    } else {
+        & $venvPython -B -c "import fastapi, uvicorn, pydantic, pyarrow" 2>$null
+        if ($LASTEXITCODE -eq 0) {
+            Write-Host "  ✓ Python dependencies present" -ForegroundColor Green
+            $pass++
+        } else {
+            Write-Host "  ✗ Python dependencies missing from orchestrator/.venv" -ForegroundColor Red
+            Write-Host "    Fix: $venvPython -m pip install --no-cache-dir --require-hashes --only-binary cryptography,pyarrow -r $requirementsPath -r $dataGuardRequirementsPath" -ForegroundColor DarkGray
+            $fail++
+        }
+    }
+}
+
+# Register the checked-in pre-push guard without replacing a custom hook directory.
+if (Get-Command git -ErrorAction SilentlyContinue) {
+    $hooksPath = (& git -C $ScriptDir config --get core.hooksPath 2>$null) -join ""
+    if (-not $hooksPath -and -not $CheckOnly) {
+        & git -C $ScriptDir config core.hooksPath .githooks
+        if ($LASTEXITCODE -eq 0) { $hooksPath = ".githooks" }
+    }
+    if ($hooksPath -eq ".githooks") {
+        Write-Host "  Repository data pre-push guard enabled" -ForegroundColor Green
+        $pass++
+    } elseif ($hooksPath) {
+        Write-Host "  Existing Git hooksPath '$hooksPath' was preserved. Integrate .githooks/pre-push before pushing." -ForegroundColor Yellow
+        $warn++
+    } else {
+        Write-Host "  Repository data pre-push guard is not enabled. Run: git config core.hooksPath .githooks" -ForegroundColor Red
+        $fail++
     }
 }
 

@@ -78,7 +78,7 @@ param (
     [switch]$RebuildContainers,      # Force container image rebuilds
     [switch]$ReusePatients,          # Reuse existing patients — skip Synthea/Loader, keep emulator
     [switch]$ReseedData,            # Authoritatively replace FHIR data with a freshly loaded patient set
-    [switch]$UseCachedSynthea,       # Use cached/prepackaged Synthea patient bundles
+    [switch]$UseCachedSynthea,       # Generate the canonical 100-patient fixture locally
     [hashtable]$Tags = @{},            # Resource tags (e.g. @{SecurityControl='Ignore'})
     [string]$ExpectedTenantId = "8d038e6a-9b7d-4cb8-bbcf-e84dff156478",
     [string]$ExpectedSubscriptionId = "9bbee190-dc61-4c58-ab47-1275cb04018f",
@@ -202,6 +202,8 @@ if (-not $Teardown -and -not $Phase2 -and -not $Phase3 -and -not $Phase4 -and -n
 }
 
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+. (Join-Path $ScriptDir "utilities/python-runtime.ps1")
+$deploymentPython = $null
 Push-Location $ScriptDir
 
 $DicomToolkitRepoUrl = "https://github.com/kfprugger/FabricDicomCohortingToolkit.git"
@@ -412,21 +414,22 @@ function Test-Prerequisites {
         Write-Host "  ✗ Not logged in to Azure" -ForegroundColor Red
     }
 
-    # 6. Python 3.10+
-    try {
-        $pyVer = python --version 2>&1
-        if ($pyVer -match "(\d+)\.(\d+)\.(\d+)") {
-            $major = [int]$Matches[1]; $minor = [int]$Matches[2]
-            if ($major -ge 3 -and $minor -ge 10) {
-                Write-Host "  ✓ Python $($Matches[0])" -ForegroundColor Green
-            } else {
-                $failures += "Python 3.10+ required (current: $($Matches[0])). Install from https://python.org"
-                Write-Host "  ✗ Python $($Matches[0]) — version 3.10+ required" -ForegroundColor Red
-            }
+    # 6. Use the setup-managed interpreter, never an unrelated PATH default.
+    $windowsHost = $env:OS -eq "Windows_NT" -or $PSVersionTable.OS -match "Windows"
+    $venvPython = Join-Path $ScriptDir $(if ($windowsHost) { "orchestrator/.venv/Scripts/python.exe" } else { "orchestrator/.venv/bin/python" })
+    if (Test-Path $venvPython) {
+        $runtime = Get-PythonRuntimeInfo -File $venvPython
+        if (Test-SupportedPythonRuntime -Runtime $runtime -Windows $windowsHost) {
+            $script:deploymentPython = $runtime.executable
+            Write-Host "  ✓ Python $($runtime.version -join '.') ($($runtime.platform)) from orchestrator/.venv" -ForegroundColor Green
+        } else {
+            $support = if ($windowsHost) { "Python 3.13 x64 (AMD64)" } else { "Python 3.13-3.14" }
+            $failures += "orchestrator/.venv requires $support. Run .\setup-prereqs.ps1 to recreate it."
+            Write-Host "  ✗ Backend Python venv is incompatible or unreadable" -ForegroundColor Red
         }
-    } catch {
-        $warnings += "Python not found (only needed for device associations). Install from https://python.org"
-        Write-Host "  ⚠ Python not found (optional for Phase 1)" -ForegroundColor Yellow
+    } else {
+        $warnings += "orchestrator/.venv is missing (needed for Python diagnostics, evaluation, and HDS source deployment). Run .\setup-prereqs.ps1."
+        Write-Host "  ⚠ Setup-managed Python venv not found" -ForegroundColor Yellow
     }
 
     # 7. Git (needed for Phase 3 — DICOM toolkit)
@@ -1166,6 +1169,7 @@ function Write-Phase3Diagnostics {
         # Helper: run a diagnostic query via python using the PS-acquired token
         function Invoke-DiagQuery {
             param([string]$Server, [string]$Database, [string]$Token, [string]$Query)
+            if (-not $script:deploymentPython) { throw "Python diagnostics require orchestrator/.venv. Run .\setup-prereqs.ps1." }
             # Pass the token and query via env vars so Python doesn't need to re-authenticate
             # and we avoid any string escaping issues between PS and Python
             $env:_DIAG_SQL_TOKEN = $Token
@@ -1186,7 +1190,7 @@ for row in cur.fetchall():
     print(cols)
 conn.close()
 "@
-            $result = $pyScript | python - 2>&1
+            $result = $pyScript | & $script:deploymentPython - 2>&1
             Remove-Item Env:\_DIAG_SQL_TOKEN -ErrorAction SilentlyContinue
             Remove-Item Env:\_DIAG_SQL_QUERY -ErrorAction SilentlyContinue
             return $result
@@ -4141,10 +4145,8 @@ if ($RunEval -and -not $Teardown) {
     $evalScript = Join-Path $ScriptDir "eval/deployment_eval_harness.py"
     if (Test-Path $evalScript) {
         $evalJson = Join-Path $ScriptDir "eval/$FabricWorkspaceName-eval.json"
-        $py = Get-Command python3 -ErrorAction SilentlyContinue
-        if (-not $py) { $py = Get-Command python -ErrorAction SilentlyContinue }
-        if ($py) {
-            & $py.Source $evalScript --workspace $FabricWorkspaceName --json-out $evalJson
+        if ($script:deploymentPython) {
+            & $script:deploymentPython $evalScript --workspace $FabricWorkspaceName --json-out $evalJson
             if ($LASTEXITCODE -eq 0) {
                 Write-Host "  ✓ Deployment evaluation passed" -ForegroundColor Green
             } else {
@@ -4152,7 +4154,7 @@ if ($RunEval -and -not $Teardown) {
                 Write-Host "    Note: Data Agents are published automatically; legacy Assistants API failures require MCP validation. Ontology graph refresh remains a manual preview step." -ForegroundColor DarkGray
             }
         } else {
-            Write-Host "  ⚠ python not found; skipping evaluation" -ForegroundColor Yellow
+            Write-Host "  ⚠ Compatible orchestrator/.venv not found; run .\setup-prereqs.ps1 before evaluation" -ForegroundColor Yellow
         }
     } else {
         Write-Host "  ⚠ eval harness not found at $evalScript" -ForegroundColor Yellow

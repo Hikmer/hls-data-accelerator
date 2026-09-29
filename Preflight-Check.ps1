@@ -107,7 +107,7 @@ try {
     $procArch = [System.Runtime.InteropServices.RuntimeInformation]::ProcessArchitecture.ToString()
     if ($hostArch -eq "Arm64" -and $procArch -ne "Arm64") {
         $checks += @{ name = "Architecture"; status = "warn"; detail = "Host=$hostArch, PowerShell=$procArch (emulation)" }
-        $warnings += "ARM64 host detected but PowerShell is running as $procArch. Use native ARM64 tooling where possible for better performance."
+        $warnings += "ARM64 host detected but PowerShell is running as $procArch. Native ARM64 PowerShell is supported; the Windows orchestrator requires Python 3.13 x64 (AMD64), using x64 emulation on Windows 11 ARM64."
         Write-Host "  ⚠ Architecture: Host=$hostArch, PowerShell=$procArch (emulation)" -ForegroundColor Yellow
     } else {
         $checks += @{ name = "Architecture"; status = "pass"; detail = "Host=$hostArch, PowerShell=$procArch" }

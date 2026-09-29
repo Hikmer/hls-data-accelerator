@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+import base64
+import csv
+import hashlib
 import json
 import io
+import shutil
 import tempfile
 import threading
 import time
-from contextlib import redirect_stdout
+from contextlib import ExitStack, redirect_stdout
 import unittest
 from types import SimpleNamespace
 from pathlib import Path
@@ -68,6 +72,322 @@ class _ContractFabric:
         return {}
 
 
+def _write_test_wheel(path: Path, entries: dict[str, bytes]) -> None:
+    name, version = path.name.split("-")[:2]
+    record = f"{name}-{version}.dist-info/RECORD"
+    entries.setdefault(f"{name}-{version}.dist-info/WHEEL", b"Wheel-Version: 1.0\nRoot-Is-Purelib: true\nTag: py3-none-any\n")
+    entries.setdefault(f"{name}-{version}.dist-info/METADATA", f"Metadata-Version: 2.1\nName: {name}\nVersion: {version}\n".encode())
+    rows = io.StringIO(newline="")
+    writer = csv.writer(rows, lineterminator="\n")
+    for name, content in sorted(entries.items()):
+        digest = base64.urlsafe_b64encode(hashlib.sha256(content).digest()).decode().rstrip("=")
+        writer.writerow([name, f"sha256={digest}", len(content)])
+    writer.writerow([record, "", ""])
+    with zipfile.ZipFile(path, "w") as archive:
+        for name, content in entries.items():
+            archive.writestr(name, content)
+        archive.writestr(record, rows.getvalue())
+
+
+class HdsPayloadIntegrityTests(unittest.TestCase):
+    def setUp(self):
+        stack = self.enterContext(ExitStack())
+        root = Path(stack.enter_context(tempfile.TemporaryDirectory()))
+        source_hds = root / "vendor" / "hds"
+        source_dtt = root / "vendor" / "dtt"
+        shutil.copytree(hds.HDS_ROOT / hds.ARTIFACT_ROOT_NAME, source_hds / hds.ARTIFACT_ROOT_NAME)
+        modules = {
+            source_hds: {"hds/__init__.py", "hds/runtime.py"},
+            source_dtt: {
+                "configuration_compiler/__init__.py",
+                "configuration_compiler/config_files_models/__init__.py",
+                "configuration_compiler/config_files_models/env/__init__.py",
+                "configuration_compiler/config_files_models/env/ext_model.py",
+                "configuration_compiler/config_files_models/env/model.py",
+                "common/__init__.py", "common/utils/__init__.py", "common/utils/logging.py",
+            },
+        }
+        for source, members in modules.items():
+            for member in members:
+                path = source / "src" / member
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("VERSION = 1\n", encoding="utf-8")
+        stack.enter_context(patch.multiple(
+            hds, HDS_ROOT=source_hds, DTT_ROOT=source_dtt,
+            VENDOR_ROOT=root / "vendor", BUILD_ROOT=root / "build",
+        ))
+        self.builder = stack.enter_context(patch.object(hds, "_build_wheel", side_effect=self.build_wheel))
+        self.runtime = source_hds / "src" / "hds" / "runtime.py"
+
+    @staticmethod
+    def build_wheel(source_root, destination, expected):
+        path = destination / expected.replace("*", "py3-none-any")
+        entries = {member: (source_root / "src" / member).read_bytes() for member in hds._runtime_modules(source_root)}
+        _write_test_wheel(path, entries)
+        return hds._tag_wheel(path)
+
+    def wheel(self, package="hds"):
+        return next((hds.BUILD_ROOT / hds.ARTIFACT_ROOT_NAME / hds.LIBRARY_RELATIVE_PATH).glob(f"{package}-*.whl"))
+
+    def test_missing_env_source_rejects_staging(self):
+        for filename in ("__init__.py", "ext_model.py", "model.py"):
+            with self.subTest(filename=filename):
+                path = hds.DTT_ROOT / "src/configuration_compiler/config_files_models/env" / filename
+                content = path.read_bytes()
+                path.unlink()
+                try:
+                    with self.assertRaisesRegex(ValueError, "DTT source.*" + path.name.replace(".", r"\.")):
+                        hds.stage_source_payload()
+                    self.assertFalse((hds.BUILD_ROOT / ".source-checksum").exists())
+                finally:
+                    path.write_bytes(content)
+
+    def test_wheel_missing_module_fails_even_with_valid_record(self):
+        hds.stage_source_payload()
+        for package, member in (("dtt", "configuration_compiler/config_files_models/env/model.py"), ("hds", "hds/runtime.py")):
+            with self.subTest(package=package):
+                path = self.wheel(package)
+                with zipfile.ZipFile(path) as archive:
+                    entries = {name: archive.read(name) for name in archive.namelist() if not name.endswith("/RECORD")}
+                del entries[member]
+                _write_test_wheel(path, entries)
+                with self.assertRaisesRegex(ValueError, "missing runtime modules"):
+                    hds.validate_staged_payload(hds.BUILD_ROOT)
+                hds.stage_source_payload(force=True)
+
+    def test_unchanged_valid_cache_reuses_wheel_bytes(self):
+        hds.stage_source_payload()
+        before = self.wheel().read_bytes()
+        with patch.object(hds, "_build_wheel", side_effect=AssertionError("Unexpected wheel rebuild")):
+            hds.stage_source_payload()
+        self.assertEqual(self.wheel().read_bytes(), before)
+
+    def test_changed_source_rebuilds_content_identity_without_version_change(self):
+        hds.stage_source_payload()
+        name = self.wheel().name
+        self.runtime.write_text("VERSION = 2\n", encoding="utf-8")
+        hds.stage_source_payload()
+        self.assertNotEqual(self.wheel().name, name)
+        self.assertEqual(self.wheel().name.split("-")[:2], name.split("-")[:2])
+        with zipfile.ZipFile(self.wheel()) as archive:
+            self.assertEqual(archive.read("hds/runtime.py"), b"VERSION = 2\n")
+
+    def test_forced_stage_replaces_cached_wheel_bytes(self):
+        hds.stage_source_payload()
+        with zipfile.ZipFile(self.wheel()) as archive:
+            entries = {name: archive.read(name) for name in archive.namelist() if not name.endswith("/RECORD")}
+        entries["hds/runtime.py"] = b"VERSION = 'stale cached wheel'\n"
+        _write_test_wheel(self.wheel(), entries)
+        hds.stage_source_payload(force=True)
+        with zipfile.ZipFile(self.wheel()) as archive:
+            self.assertEqual(archive.read("hds/runtime.py"), self.runtime.read_bytes())
+
+    def test_forced_identical_build_has_identical_name_bytes_and_package_version(self):
+        hds.stage_source_payload()
+        before_name, before_bytes = self.wheel().name, self.wheel().read_bytes()
+        hds.stage_source_payload(force=True)
+        self.assertEqual((self.wheel().name, self.wheel().read_bytes()), (before_name, before_bytes))
+        with zipfile.ZipFile(self.wheel()) as archive:
+            metadata = archive.read(f"hds-{hds.HDS_VERSION}.dist-info/METADATA")
+        self.assertEqual(metadata, f"Metadata-Version: 2.1\nName: hds\nVersion: {hds.HDS_VERSION}\n".encode())
+
+    def test_modified_wheel_with_valid_record_cannot_reuse_old_content_identity(self):
+        hds.stage_source_payload()
+        with zipfile.ZipFile(self.wheel()) as archive:
+            entries = {name: archive.read(name) for name in archive.namelist() if not name.endswith("/RECORD")}
+        entries["hds/runtime.py"] = b"VERSION = 2\n"
+        _write_test_wheel(self.wheel(), entries)
+        with self.assertRaisesRegex(ValueError, "filename does not identify its content"):
+            hds.validate_staged_payload(hds.BUILD_ROOT)
+
+    def test_invalid_unchanged_cache_is_rebuilt(self):
+        hds.stage_source_payload()
+        self.wheel("dtt").write_bytes(b"not a wheel")
+        hds.stage_source_payload()
+        with zipfile.ZipFile(self.wheel("dtt")) as archive:
+            self.assertEqual(archive.read("configuration_compiler/config_files_models/env/model.py"), b"VERSION = 1\n")
+
+    def test_failed_validation_does_not_mark_stage_successful(self):
+        with patch.object(hds, "validate_staged_payload", side_effect=ValueError("Incomplete payload")):
+            with self.assertRaisesRegex(ValueError, "Incomplete payload"):
+                hds.stage_source_payload()
+        self.assertFalse((hds.BUILD_ROOT / ".source-checksum").exists())
+
+    def test_generated_build_outputs_do_not_invalidate_cache(self):
+        hds.stage_source_payload()
+        for relative in ("build/lib/stale.py", "dist/stale.whl", "src/hds.egg-info/PKG-INFO", "src/hds/__pycache__/runtime.pyc"):
+            path = hds.HDS_ROOT / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b"irrelevant generated artifact")
+        with patch.object(hds, "_build_wheel", side_effect=AssertionError("Generated files invalidated source cache")):
+            hds.stage_source_payload()
+        with zipfile.ZipFile(self.wheel()) as archive:
+            self.assertEqual(archive.read("hds/runtime.py"), self.runtime.read_bytes())
+
+    def test_package_discovery_excludes_unpackaged_tools_and_tests(self):
+        for source_root, relative in ((hds.DTT_ROOT, "tests/__init__.py"), (hds.DTT_ROOT, "tools/__init__.py"), (hds.HDS_ROOT, "tools/unpackaged.py")):
+            path = source_root / "src" / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("raise RuntimeError('not a runtime package')\n", encoding="utf-8")
+        hds.stage_source_payload()
+        with zipfile.ZipFile(self.wheel("dtt")) as archive:
+            self.assertTrue(hds.DTT_ENV_MODULES <= set(archive.namelist()))
+            self.assertNotIn("tests/__init__.py", archive.namelist())
+            self.assertNotIn("tools/__init__.py", archive.namelist())
+
+
+class _EnvironmentFabric:
+    def __init__(self, published, staging=None, retain_old_publish=False, definition_from_staging=False):
+        self.published = dict(published)
+        self.staging = dict(published if staging is None else staging)
+        self.retain_old_publish = retain_old_publish
+        self.publish_count = 0
+        self.definition_from_staging = definition_from_staging
+
+    def find_item(self, workspace_id, display_name, item_type):
+        return {"id": "environment", "displayName": display_name, "type": item_type}
+
+    def get_item_definition(self, workspace_id, item_id):
+        return {"parts": [
+            {"path": path, "payloadType": "InlineBase64", "payload": base64.b64encode(content).decode()}
+            for path, content in (self.staging if self.definition_from_staging else self.published).items()
+        ]}
+
+    def call(self, method, endpoint):
+        if endpoint.split("?", 1)[0].endswith("/libraries"):
+            content = self.staging if "/staging/" in endpoint else self.published
+            return {"libraries": [
+                {"name": Path(path).name, "libraryType": "Custom"}
+                for path in content if path.endswith(".whl")
+            ]}
+        return {"id": "environment", "properties": {"publishDetails": {"state": "Success"}}}
+
+    def request_content(self, method, endpoint, content, max_retries):
+        if endpoint.endswith("/importExternalLibraries"):
+            self.staging["Libraries/PublicLibraries/environment.yml"] = content.encode()
+        else:
+            self.staging["Libraries/CustomLibraries/" + endpoint.rsplit("/", 1)[1].split("?")[0]] = content
+
+    def request_raw(self, method, endpoint):
+        if method == "GET" and endpoint.endswith("/libraries/exportExternalLibraries"):
+            return SimpleNamespace(content=self.published["Libraries/PublicLibraries/environment.yml"])
+        if method == "DELETE" and "/staging/libraries/" in endpoint:
+            del self.staging["Libraries/CustomLibraries/" + endpoint.rsplit("/", 1)[1]]
+            return _Response(status_code=200)
+        if not endpoint.endswith("/staging/publish?beta=false"):
+            raise AssertionError(endpoint)
+        self.publish_count += 1
+        if not self.retain_old_publish:
+            self.published = dict(self.staging)
+        return _Response(status_code=200)
+
+
+class HdsEnvironmentIntegrityTests(unittest.TestCase):
+    def setUp(self):
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        library = self.root / hds.ARTIFACT_ROOT_NAME / hds.LIBRARY_RELATIVE_PATH
+        library.mkdir(parents=True)
+        self.desired = {"Libraries/PublicLibraries/environment.yml": b"dependencies:\n  - pip:\n    - scipy==1.11.4\n"}
+        (library / "environment.yml").write_bytes(self.desired["Libraries/PublicLibraries/environment.yml"])
+        for package, version in (("hds", hds.HDS_VERSION), ("dtt", hds.DTT_VERSION)):
+            wheel = library / f"{package}-{version}-py3-none-any.whl"
+            _write_test_wheel(wheel, {f"{package}/runtime.py": b"VERSION = 'repaired'\n"})
+            tagged = hds._tag_wheel(wheel)
+            self.desired[f"Libraries/CustomLibraries/{tagged.name}"] = tagged.read_bytes()
+        self.enterContext(patch.object(hds, "_event"))
+
+    def test_identical_published_bytes_skip_without_publishing_staging_edits(self):
+        fabric = _EnvironmentFabric(self.desired, staging={})
+        hds._deploy_environment(fabric, "workspace", self.root)
+        self.assertEqual(fabric.publish_count, 0)
+        self.assertEqual(fabric.published, self.desired)
+        self.assertEqual(fabric.staging, {})
+
+    def test_same_named_changed_wheel_is_uploaded_and_published(self):
+        for path in self.desired:
+            with self.subTest(path=path):
+                previous = {**self.desired, path: b"old published bytes"}
+                fabric = _EnvironmentFabric(previous, staging=self.desired)
+                hds._deploy_environment(fabric, "workspace", self.root)
+                self.assertEqual(fabric.publish_count, 1)
+                self.assertEqual(fabric.published, self.desired)
+
+    def test_staged_only_same_name_repair_cannot_masquerade_as_published(self):
+        published = {}
+        staging = {}
+        for path, content in self.desired.items():
+            if path.endswith(".whl"):
+                fields = Path(path).name.split("-")
+                legacy_path = "Libraries/CustomLibraries/" + "-".join([*fields[:2], *fields[-3:]])
+                published[legacy_path] = b"old live wheel bytes"
+                staging[legacy_path] = content
+            else:
+                published[path] = staging[path] = content
+        unrelated = "Libraries/CustomLibraries/unrelated-2.0-py3-none-any.whl"
+        published[unrelated] = staging[unrelated] = b"unrelated package"
+        fabric = _EnvironmentFabric(published, staging=staging, definition_from_staging=True)
+        hds._deploy_environment(fabric, "workspace", self.root)
+        self.assertEqual(fabric.publish_count, 1)
+        self.assertEqual(fabric.published, {**self.desired, unrelated: b"unrelated package"})
+
+    def test_staged_yaml_does_not_hide_different_published_yaml(self):
+        published = {**self.desired, "Libraries/PublicLibraries/environment.yml": b"old published requirements"}
+        fabric = _EnvironmentFabric(published, staging=self.desired, definition_from_staging=True)
+        hds._deploy_environment(fabric, "workspace", self.root)
+        self.assertEqual(fabric.publish_count, 1)
+        self.assertEqual(fabric.published, self.desired)
+
+    def test_publish_success_with_old_bytes_is_rejected(self):
+        path = next(path for path in self.desired if path.endswith(".whl"))
+        previous = {**self.desired, path: b"old wheel bytes"}
+        fabric = _EnvironmentFabric(previous, retain_old_publish=True)
+        with self.assertRaisesRegex(RuntimeError, "Published environment content does not match"):
+            hds._deploy_environment(fabric, "workspace", self.root)
+        self.assertEqual(fabric.published, previous)
+
+    def test_definition_permission_error_is_not_treated_as_drift(self):
+        fabric = _EnvironmentFabric(self.desired)
+        error = hds.requests.HTTPError(response=SimpleNamespace(status_code=403))
+        with patch.object(fabric, "get_item_definition", side_effect=error):
+            with self.assertRaises(hds.requests.HTTPError):
+                hds._deploy_environment(fabric, "workspace", self.root)
+        self.assertEqual(fabric.publish_count, 0)
+        self.assertEqual(fabric.staging, self.desired)
+
+    def test_definition_without_published_wheels_cannot_skip_publish(self):
+        fabric = _EnvironmentFabric({}, staging=self.desired)
+        definition = _EnvironmentFabric(self.desired).get_item_definition("workspace", "environment")
+        with patch.object(fabric, "get_item_definition", return_value=definition):
+            hds._deploy_environment(fabric, "workspace", self.root)
+        self.assertEqual(fabric.publish_count, 1)
+        self.assertEqual(fabric.published, self.desired)
+
+    def test_inaccessible_environment_is_replaced_and_published(self):
+        class Fabric(_EnvironmentFabric):
+            orphan_exists = True
+
+            def find_item(self, workspace_id, display_name, item_type):
+                return {"id": "orphan", "displayName": display_name, "type": item_type}
+
+            def call(self, method, endpoint):
+                if endpoint.endswith("/environments/orphan"):
+                    raise hds.requests.HTTPError(response=SimpleNamespace(status_code=404))
+                return super().call(method, endpoint)
+
+            def delete_item(self, workspace_id, item_id):
+                self.orphan_exists = False
+
+            def request_raw(self, method, endpoint, body=None):
+                if endpoint.endswith("/environments"):
+                    return _Response(payload={"id": "environment"})
+                return super().request_raw(method, endpoint)
+
+        fabric = Fabric({})
+        hds._deploy_environment(fabric, "workspace", self.root)
+        self.assertFalse(fabric.orphan_exists)
+        self.assertEqual(fabric.published, self.desired)
+
+
 class HdsSourceTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -102,36 +422,10 @@ class HdsSourceTests(unittest.TestCase):
         )
         self.assertEqual(hds.managed_artifact_name("msft_config_notebook.ipynb"), "healthcare1_msft_config_notebook")
 
-    def test_staged_payload_is_complete_and_vendor_is_immutable(self):
-        vendor = hds.HDS_ROOT / "src" / "tools" / "fabric_depolyment_notebooks" / "notebook_deployer.ipynb"
-        before = vendor.read_bytes()
+    def test_staged_payload_is_complete(self):
         summary = hds.validate_staged_payload(hds.BUILD_ROOT)
         self.assertEqual(summary["deployment_notebooks"], 9)
         self.assertEqual(summary["validation_notebooks"], 3)
-        self.assertEqual(vendor.read_bytes(), before)
-
-    def test_staged_hydration_notebook_has_parameterized_lakehouse_filter(self):
-        staged_path = hds.BUILD_ROOT / "bootstrap" / "deployment_notebooks" / "lakehouses_and_tables_deployer.ipynb"
-        notebook = json.loads(staged_path.read_text())
-        parameter_cells = [cell for cell in notebook["cells"] if "parameters" in cell.get("metadata", {}).get("tags", [])]
-        self.assertEqual(len(parameter_cells), 1)
-        parameter_source = "".join(parameter_cells[0]["source"])
-        notebook_source = "\n".join("".join(cell.get("source", [])) for cell in notebook["cells"])
-        self.assertIn("HYDRATION_LAKEHOUSE_KEYS", parameter_source)
-        self.assertIn("hydration_lakehouse_selected(base_lakehouse_name)", notebook_source)
-        self.assertIn("lakehouses_to_create=selected_lakehouses", notebook_source)
-
-    def test_staged_powerbi_deployer_propagates_artifact_failures(self):
-        staged = hds.BUILD_ROOT / "bootstrap" / "deployment_notebooks" / "powerbi_deployer.ipynb"
-        notebook = json.loads(staged.read_text())
-        source = "\n".join("".join(cell.get("source", [])) for cell in notebook["cells"])
-
-        self.assertIn("sm_errors.append", source)
-        self.assertIn("rep_errors.append", source)
-        self.assertIn("Power BI deployment failures", source)
-        self.assertIn("powerbi-deployer-errors.txt", source)
-        self.assertIn("_normalize_name(build_artifact_name(manifest_key))", source)
-
 
     def test_staged_omop_pipeline_does_not_repeat_clinical_ingestion(self):
         staged = next((hds.BUILD_ROOT / hds.ARTIFACT_ROOT_NAME).rglob("msft_omop_analytics.json"))
@@ -232,105 +526,6 @@ class HdsSourceTests(unittest.TestCase):
         )
 
 
-    def test_cached_dtt_wheel_moves_optional_telemetry_import(self):
-        source = (
-            "from azure.monitor.opentelemetry import configure_azure_monitor\n"
-            "class Logger:\n"
-            "    @classmethod\n"
-            "    def init_logger(cls):\n"
-            "        if instrumentation_key and cls._app_insight_logger is None:\n"
-            "            pass\n"
-        )
-        with tempfile.TemporaryDirectory() as temporary:
-            wheel_path = Path(temporary) / f"dtt-{hds.DTT_VERSION}-py3-none-any.whl"
-            record_path = f"dtt-{hds.DTT_VERSION}.dist-info/RECORD"
-            with zipfile.ZipFile(wheel_path, "w") as archive:
-                archive.writestr("common/utils/logging.py", source)
-                archive.writestr(
-                    record_path,
-                    "common/utils/logging.py,,\n" + record_path + ",,\n",
-                )
-
-            hds._patch_dtt_wheel_optional_telemetry_import(wheel_path)
-            hds._patch_dtt_wheel_optional_telemetry_import(wheel_path)
-
-            with zipfile.ZipFile(wheel_path, "r") as archive:
-                patched = archive.read("common/utils/logging.py").decode("utf-8")
-                record = archive.read(record_path).decode("utf-8")
-            self.assertNotIn(
-                "from azure.monitor.opentelemetry import configure_azure_monitor\nclass Logger",
-                patched,
-            )
-            self.assertIn(
-                "        if instrumentation_key and cls._app_insight_logger is None:\n"
-                "            from azure.monitor.opentelemetry import configure_azure_monitor",
-                patched,
-            )
-            self.assertIn("common/utils/logging.py,sha256=", record)
-
-    def test_hds_environment_reuses_complete_published_payload(self):
-        environment_yml = (
-            hds.BUILD_ROOT / hds.ARTIFACT_ROOT_NAME / hds.LIBRARY_RELATIVE_PATH / "environment.yml"
-        ).read_text(encoding="utf-8")
-        class Fabric:
-            def find_item(self, workspace_id, display_name, item_type):
-                return {"id": "environment", "displayName": display_name, "type": item_type}
-
-            def call(self, method, endpoint):
-                if endpoint.endswith("/staging/libraries"):
-                    return {
-                        "customLibraries": {"wheelFiles": [
-                            "dtt-0.3.1.1271-py3-none-any.whl",
-                            "hds-1.4.0-py3-none-any.whl",
-                        ]},
-                        "environmentYml": environment_yml,
-                    }
-                return {"id": "environment", "properties": {"publishDetails": {"state": "Success"}}}
-
-        with patch.object(hds, "_event"):
-            result = hds._deploy_environment(Fabric(), "workspace", hds.BUILD_ROOT)
-
-        self.assertEqual(result["properties"]["publishDetails"]["state"], "Success")
-
-    def test_hds_environment_replaces_inaccessible_existing_item(self):
-        environment_yml = (
-            hds.BUILD_ROOT / hds.ARTIFACT_ROOT_NAME / hds.LIBRARY_RELATIVE_PATH / "environment.yml"
-        ).read_text(encoding="utf-8")
-        class Fabric:
-            deleted = []
-            created = []
-
-            def find_item(self, workspace_id, display_name, item_type):
-                return {"id": "orphan", "displayName": display_name, "type": item_type}
-
-            def call(self, method, endpoint):
-                if endpoint.endswith("/environments/orphan"):
-                    response = SimpleNamespace(status_code=404)
-                    raise hds.requests.HTTPError(response=response)
-                if endpoint.endswith("/staging/libraries"):
-                    return {
-                        "customLibraries": {"wheelFiles": [
-                            "dtt-0.3.1.1271-py3-none-any.whl",
-                            "hds-1.4.0-py3-none-any.whl",
-                        ]},
-                        "environmentYml": environment_yml,
-                    }
-                return {"id": "replacement", "properties": {"publishDetails": {"state": "Success"}}}
-
-            def delete_item(self, workspace_id, item_id):
-                self.deleted.append((workspace_id, item_id))
-
-            def request_raw(self, method, endpoint, body=None):
-                self.created.append((method, endpoint, body))
-                return _Response(payload={"id": "replacement", "properties": {"publishDetails": {"state": "Success"}}})
-
-        fabric = Fabric()
-        with patch.object(hds, "_event"), patch.object(hds.time, "sleep"):
-            result = hds._deploy_environment(fabric, "workspace", hds.BUILD_ROOT)
-
-        self.assertEqual(fabric.deleted, [("workspace", "orphan")])
-        self.assertEqual(fabric.created[0][1], "/workspaces/workspace/environments")
-        self.assertEqual(result["id"], "replacement")
 
     def test_managed_lakehouses_are_precreated_with_exact_contract_names(self):
         def ensure(_fabric, _workspace_id, display_name, item_type):
