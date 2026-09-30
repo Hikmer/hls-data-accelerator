@@ -18,6 +18,17 @@ logger = logging.getLogger(__name__)
 FABRIC_RESOURCE = "https://api.fabric.microsoft.com"
 FABRIC_API_BASE = "https://api.fabric.microsoft.com/v1"
 
+# Transient network failures (e.g. ConnectionResetError / WinError 10054, aborted
+# chunked transfers, read timeouts) that can interrupt long Fabric publishes such
+# as the HDS environment and bootstrap notebook uploads. These are retried with
+# backoff instead of aborting the operation, complementing the HTTP
+# 429/5xx/inbound-policy retries below.
+_TRANSIENT_NETWORK_ERRORS = (
+    requests.exceptions.ConnectionError,
+    requests.exceptions.ChunkedEncodingError,
+    requests.exceptions.Timeout,
+)
+
 
 class FabricClient:
     """Wrapper for Fabric REST API calls with retry and LRO support."""
@@ -117,6 +128,20 @@ class FabricClient:
                 # Deterministic 4xx responses have already bypassed the retry branch
                 # above. Retrying them hides configuration and permission failures.
                 raise
+            except _TRANSIENT_NETWORK_ERRORS as exc:
+                if attempt >= max_retries:
+                    raise
+                delay = min(20, 5 * attempt)
+                logger.warning(
+                    "Transient network error on %s (attempt %d/%d): %s. Retrying in %ds.",
+                    endpoint,
+                    attempt,
+                    max_retries,
+                    exc,
+                    delay,
+                )
+                time.sleep(delay)
+                continue
 
         return None
 
@@ -136,9 +161,17 @@ class FabricClient:
 
         while time.time() < deadline:
             time.sleep(retry_after)
-            resp = requests.get(
-                poll_url, headers=self._headers(), timeout=60
-            )
+            try:
+                resp = requests.get(
+                    poll_url, headers=self._headers(), timeout=60
+                )
+            except _TRANSIENT_NETWORK_ERRORS as exc:
+                logger.warning(
+                    "Transient network error polling LRO %s: %s. Retrying.",
+                    poll_url,
+                    exc,
+                )
+                continue
 
             if resp.status_code == 200:
                 data = resp.json() if resp.content else {}
@@ -167,13 +200,27 @@ class FabricClient:
         """Issue a Fabric request while preserving response headers and body."""
         url = endpoint if endpoint.startswith("http") else f"{self.api_base}{endpoint}"
         for attempt in range(1, max_retries + 1):
-            response = requests.request(
-                method,
-                url,
-                headers=self._headers(),
-                json=body if body is not None else None,
-                timeout=120,
-            )
+            try:
+                response = requests.request(
+                    method,
+                    url,
+                    headers=self._headers(),
+                    json=body if body is not None else None,
+                    timeout=120,
+                )
+            except _TRANSIENT_NETWORK_ERRORS as exc:
+                if attempt >= max_retries:
+                    raise
+                logger.warning(
+                    "Transient network error on %s %s (attempt %d/%d): %s. Retrying.",
+                    method,
+                    endpoint,
+                    attempt,
+                    max_retries,
+                    exc,
+                )
+                time.sleep(min(20, 5 * attempt))
+                continue
             retryable = (
                 response.status_code == 429
                 or response.status_code >= 500
@@ -203,13 +250,27 @@ class FabricClient:
         for attempt in range(1, max_retries + 1):
             headers = self._headers()
             headers["Content-Type"] = content_type
-            response = requests.request(
-                method,
-                url,
-                headers=headers,
-                data=content,
-                timeout=120,
-            )
+            try:
+                response = requests.request(
+                    method,
+                    url,
+                    headers=headers,
+                    data=content,
+                    timeout=120,
+                )
+            except _TRANSIENT_NETWORK_ERRORS as exc:
+                if attempt >= max_retries:
+                    raise
+                logger.warning(
+                    "Transient network error on %s %s (attempt %d/%d): %s. Retrying.",
+                    method,
+                    endpoint,
+                    attempt,
+                    max_retries,
+                    exc,
+                )
+                time.sleep(min(20, 5 * attempt))
+                continue
             retryable = (
                 response.status_code in {404, 429}
                 or response.status_code >= 500
