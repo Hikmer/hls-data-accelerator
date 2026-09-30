@@ -228,6 +228,11 @@ hls-data-accelerator/
 
 ## Validation
 
+For published agents with stale schema references, use the read-only-by-default
+[Data Agent schema refresh utility](docs/DATA-AGENT-SCHEMA-REFRESH.md).
+It validates current metadata against the published table contract before an
+explicit update and republish.
+
 A created resource is not automatically a working surface. The deployment and evaluation paths distinguish these gates:
 
 - Azure resources exist and managed-identity RBAC is present.

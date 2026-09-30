@@ -8,12 +8,9 @@ if ($parseErrors -and $parseErrors.Count -gt 0) {
     throw "deploy-payer-rti.ps1 has parse errors: $($parseErrors[0].Message)"
 }
 
+. (Join-Path $PSScriptRoot '..\..\utilities\data-agent-selection.ps1')
+
 foreach ($functionName in @(
-    'Set-DataAgentSelectionValue',
-    'Update-DataAgentLakehouseElementSelection',
-    'Update-DataAgentKustoElementSelection',
-    'Get-SelectedDataAgentTables',
-    'Get-SelectedDataAgentFunctions',
     'New-KqlDatasource',
     'New-LakehouseDatasource',
     'New-OntologyDatasourceIfAvailable',
@@ -142,7 +139,7 @@ $kustoDatasource = New-KqlDatasource `
     -Functions $kustoFunctions
 Assert-Equal -Expected 'kusto' -Actual $kustoDatasource.SelectionKind -Message 'KQL datasource should request Kusto hydration repair.'
 Assert-Equal -Expected ($kustoTargets -join ',') -Actual (@($kustoDatasource.SelectedTables) -join ',') -Message 'KQL datasource metadata should retain the Eventhouse table contract.'
-Assert-Equal -Expected ($kustoFunctions -join ',') -Actual (@($kustoDatasource.SelectedFunctions) -join ',') -Message 'KQL datasource metadata should retain the Kusto function contract.'
+Assert-Equal -Expected 0 -Actual @($kustoDatasource.SelectedFunctions).Count -Message 'Initial KQL datasource definitions must omit unsupported hand-built function selections.'
 
 $goldFewShots = @(
     @{ id = 'gold-shot'; question = 'Summarize historical claims.'; query = 'SELECT COUNT(*) FROM dbo.fact_claim' }
@@ -154,7 +151,7 @@ $datasource = New-LakehouseDatasource `
     -Tables $targetTables `
     -Instructions 'Use the selected Gold tables.' `
     -FewShots $goldFewShots
-Assert-Equal -Expected 'lakehouse_tables-healthcare1_reporting_gold' -Actual $datasource.FolderName -Message 'Datasource folder convention changed unexpectedly.'
+Assert-Equal -Expected 'lakehouse-tables-healthcare1_reporting_gold' -Actual $datasource.FolderName -Message 'Datasource folder must match the Fabric-normalized convention.'
 Assert-Equal -Expected ($targetTables -join ',') -Actual (@($datasource.SelectedTables) -join ',') -Message 'Datasource metadata should retain the requested table contract for post-hydration repair.'
 Assert-Equal -Expected 'lakehouse' -Actual $datasource.SelectionKind -Message 'Lakehouse datasource should request Lakehouse hydration repair.'
 $decodedGoldFewShots = $datasource.FewShotsJson | ConvertFrom-Json -Depth 20
@@ -190,7 +187,7 @@ function Repair-DataAgentTableSelection {
     param($WorkspaceId, $DataAgentId, $DatasourceFolderName, $Tables, $Functions, $SelectionKind)
     $expected = if ($SelectionKind -eq 'kusto') { $kustoTargets } else { $targetTables }
     Assert-Equal -Expected ($expected -join ',') -Actual (@($Tables) -join ',') -Message "Deploy should pass the exact $SelectionKind table contract to hydrated selection repair."
-    if ($SelectionKind -eq 'kusto') { Assert-Equal -Expected ($kustoFunctions -join ',') -Actual (@($Functions) -join ',') -Message 'Deploy should pass the exact Kusto function contract to hydrated selection repair.' }
+    if ($SelectionKind -eq 'kusto') { Assert-Equal -Expected 0 -Actual @($Functions).Count -Message 'Deploy should preserve the native-table-only initial Kusto contract.' }
     $script:CallOrder.Add("repair-$SelectionKind")
 }
 function Publish-DataAgentDefinition { param($WorkspaceId, $DataAgentId, $Description) $script:CallOrder.Add('publish') }
@@ -198,7 +195,7 @@ function Assert-DataAgentTableSelection {
     param($WorkspaceId, $DataAgentId, $DatasourceFolderName, $Tables, $Functions, $SelectionKind)
     $expected = if ($SelectionKind -eq 'kusto') { $kustoTargets } else { $targetTables }
     Assert-Equal -Expected ($expected -join ',') -Actual (@($Tables) -join ',') -Message "Deploy should verify the exact $SelectionKind table contract after publish."
-    if ($SelectionKind -eq 'kusto') { Assert-Equal -Expected ($kustoFunctions -join ',') -Actual (@($Functions) -join ',') -Message 'Deploy should verify the exact Kusto function contract after publish.' }
+    if ($SelectionKind -eq 'kusto') { Assert-Equal -Expected 0 -Actual @($Functions).Count -Message 'Deploy should verify the native-table-only initial Kusto contract after publish.' }
     $script:CallOrder.Add("assert-$SelectionKind")
 }
 
