@@ -2595,9 +2595,13 @@ if (($Phase4 -or ($Phase2 -and -not $Phase3)) -and -not $SkipOntology) {
                 $pyIncludeDicom = if ($SkipDicom -and -not $Phase4) { "False" } else { "True" }
 
                 # Placeholders live inside JSON string literals, so their quotes are backslash-escaped.
+                # MIRROR_LAKEHOUSE_ID must be replaced BEFORE LAKEHOUSE_ID: the token
+                # "LAKEHOUSE_ID = \"\"" is a substring of "MIRROR_LAKEHOUSE_ID = \"\"", so replacing
+                # LAKEHOUSE_ID first would rewrite the mirror line to the Silver id and leave the
+                # later MIRROR replace with nothing to match (mirroring Silver into itself).
                 $daIpynbJson = $daIpynbJson.Replace('WORKSPACE_ID = \"\"', "WORKSPACE_ID = \`"$p4WsId\`"")
-                $daIpynbJson = $daIpynbJson.Replace('LAKEHOUSE_ID = \"\"', "LAKEHOUSE_ID = \`"$p4SilverLhId\`"")
                 $daIpynbJson = $daIpynbJson.Replace('MIRROR_LAKEHOUSE_ID = \"\"', "MIRROR_LAKEHOUSE_ID = \`"$p4GoldLhId\`"")
+                $daIpynbJson = $daIpynbJson.Replace('LAKEHOUSE_ID = \"\"', "LAKEHOUSE_ID = \`"$p4SilverLhId\`"")
                 $daIpynbJson = $daIpynbJson.Replace('INCLUDE_FHIR = True', "INCLUDE_FHIR = $pyIncludeFhir")
                 $daIpynbJson = $daIpynbJson.Replace('INCLUDE_DICOM = True', "INCLUDE_DICOM = $pyIncludeDicom")
 
@@ -2737,6 +2741,12 @@ if (($Phase4 -or ($Phase2 -and -not $Phase3)) -and -not $SkipOntology) {
                                     $jobBody = $_.ErrorDetails.Message
                                     if ($jobStatusCode -in @(429, 500, 502, 503, 504) -or ($jobStatusCode -eq 403 -and $jobBody -match "RequestDeniedByInboundPolicy")) {
                                         Write-Host "    DeviceAssociation job status transient HTTP $jobStatusCode — retrying..." -ForegroundColor Yellow
+                                        continue
+                                    }
+                                    # Client-side timeouts / connection resets have no HTTP status code.
+                                    # Treat them as transient and keep polling within the 10-minute window.
+                                    if (-not $jobStatusCode) {
+                                        Write-Host "    DeviceAssociation job status transient network error ($($_.Exception.Message)) — retrying..." -ForegroundColor Yellow
                                         continue
                                     }
                                     throw $_
