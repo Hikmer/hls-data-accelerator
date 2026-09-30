@@ -77,7 +77,7 @@ function Invoke-FabricApi {
             try { $statusCode = [int]$_.Exception.Response.StatusCode } catch {}
             $errBody = ""
             try { $errBody = $_.ErrorDetails.Message } catch {}
-            if (($statusCode -eq 429 -or $statusCode -ge 500 -or ($statusCode -eq 403 -and $errBody -match "RequestDeniedByInboundPolicy")) -and $attempt -lt $MaxRetries) {
+            if ((($statusCode -eq 429 -or $statusCode -ge 500 -or ($statusCode -eq 403 -and $errBody -match "RequestDeniedByInboundPolicy")) -or (Test-TransientNetworkError $_)) -and $attempt -lt $MaxRetries) {
                 $retryAfter = [Math]::Min(120, 10 * [Math]::Pow(2, $attempt - 1))
                 if ($statusCode -eq 429) {
                     try { $retryAfter = [int]$_.Exception.Response.Headers["Retry-After"] } catch {}
@@ -124,7 +124,7 @@ function New-OntologyDatasourceIfAvailable {
         if (-not $ontology) { return $null }
 
         $datasourceJson = (@{
-            '$schema'              = "1.0.0"
+            '$schema'              = "https://developer.microsoft.com/json-schemas/fabric/item/dataAgent/definition/dataSource/1.0.0/schema.json"
             artifactId             = $ontology.id
             workspaceId            = $workspaceId
             displayName            = $OntologyName
@@ -132,7 +132,7 @@ function New-OntologyDatasourceIfAvailable {
             userDescription        = $UserDescription
             dataSourceInstructions = $Instructions
         } | ConvertTo-Json -Depth 10)
-        $fewShotsJson = (@{ '$schema' = "1.0.0"; fewShots = @() } | ConvertTo-Json -Depth 5)
+        $fewShotsJson = (@{ '$schema' = "https://developer.microsoft.com/json-schemas/fabric/item/dataAgent/definition/fewShots/1.0.0/schema.json"; fewShots = @() } | ConvertTo-Json -Depth 5)
         return @{ FolderName = "ontology-$OntologyName"; DatasourceJson = $datasourceJson; FewShotsJson = $fewShotsJson }
     } catch {
         Write-Host "  ⚠ Could not attach ontology datasource '$OntologyName': $($_.Exception.Message)" -ForegroundColor Yellow
@@ -193,19 +193,18 @@ if ($silverLh) {
 Write-Host ""
 
 # ============================================================================
-# KQL ELEMENTS: native tables plus deterministic aggregate helper functions
+# KQL ELEMENTS: native tables only.
+# NOTE: Do NOT add a "Functions" element (type kusto.functions / kusto.function)
+# here. The Fabric Data Agent datasource schema does not accept those element
+# types, and including them makes updateDefinition fail with the misleading
+# error "Required import part '.../kusto-*/datasource.json' contains invalid JSON".
+# The agent_* KQL helper functions are still grounded via the AI instructions and
+# few-shot examples below, so no capability is lost by omitting them here.
 # ============================================================================
 
 $kqlElements = @(
     @{ id = [guid]::NewGuid().ToString(); display_name = "TelemetryRaw";  type = "kusto.table"; is_selected = $true },
-    @{ id = [guid]::NewGuid().ToString(); display_name = "AlertHistory";  type = "kusto.table"; is_selected = $true },
-    @{ id = [guid]::NewGuid().ToString(); display_name = "Functions"; type = "kusto.functions"; is_selected = $true; children = @(
-        @{ id = [guid]::NewGuid().ToString(); display_name = "agent_CurrentAlertSeverity"; type = "kusto.function"; is_selected = $true },
-        @{ id = [guid]::NewGuid().ToString(); display_name = "agent_LowOxygen"; type = "kusto.function"; is_selected = $true },
-        @{ id = [guid]::NewGuid().ToString(); display_name = "agent_TelemetrySevenDaySummary"; type = "kusto.function"; is_selected = $true },
-        @{ id = [guid]::NewGuid().ToString(); display_name = "agent_CurrentDeviceSummary"; type = "kusto.function"; is_selected = $true },
-        @{ id = [guid]::NewGuid().ToString(); display_name = "agent_ClinicalAggregateSummary"; type = "kusto.function"; is_selected = $true }
-    ) }
+    @{ id = [guid]::NewGuid().ToString(); display_name = "AlertHistory";  type = "kusto.table"; is_selected = $true }
 )
 
 # ============================================================================
@@ -405,13 +404,43 @@ $lakehouseUserDescription = if ($IncludeDicomImaging) {
 # HELPER: Create or update a Data Agent
 # ============================================================================
 
+function Test-TransientNetworkError {
+    param($ErrorRecord)
+    # Connection-level failures (e.g. WinError 10054 "connection forcibly closed", timeouts,
+    # transport read errors) surface as exceptions with no HTTP response body — retry those.
+    $ex = $ErrorRecord.Exception
+    while ($ex) {
+        if ("$($ex.Message)" -match "forcibly closed|connection was closed|actively refused|reset by peer|10054|timed out|operation has timed out|Unable to read data from the transport|transport connection|SSL connection could not be established") {
+            return $true
+        }
+        $ex = $ex.InnerException
+    }
+    return $false
+}
+
 function Update-DataAgentDefinition {
-    param([string]$WorkspaceId, [string]$DataAgentId, [object]$Definition)
+    param([string]$WorkspaceId, [string]$DataAgentId, [object]$Definition, [int]$MaxRetries = 6)
     $headers = @{ Authorization = "Bearer $(Get-FabricAccessToken)"; "Content-Type" = "application/json" }
     $body = @{ definition = $Definition } | ConvertTo-Json -Depth 30
-    $response = Invoke-WebRequest -Method POST `
-        -Uri "$FabricApiBase/workspaces/$WorkspaceId/dataAgents/$DataAgentId/updateDefinition" `
-        -Headers $headers -Body $body -UseBasicParsing -TimeoutSec 120 -ErrorAction Stop
+    $response = $null
+    for ($try = 1; $try -le $MaxRetries; $try++) {
+        try {
+            $response = Invoke-WebRequest -Method POST `
+                -Uri "$FabricApiBase/workspaces/$WorkspaceId/dataAgents/$DataAgentId/updateDefinition" `
+                -Headers $headers -Body $body -UseBasicParsing -TimeoutSec 120 -ErrorAction Stop
+            break
+        } catch {
+            $sc = $null; try { $sc = [int]$_.Exception.Response.StatusCode } catch {}
+            if (((Test-TransientNetworkError $_) -or ($sc -in @(408, 429, 500, 502, 503, 504))) -and $try -lt $MaxRetries) {
+                $delay = [int][Math]::Min(60, 5 * [Math]::Pow(2, $try - 1))
+                Write-Host "    updateDefinition transient error (attempt $try/$MaxRetries): $($_.Exception.Message) — retrying in ${delay}s..." -ForegroundColor Yellow
+                Start-Sleep -Seconds $delay
+                continue
+            }
+            throw
+        }
+    }
+    if (-not $response) { throw "DataAgent definition update failed: no response after $MaxRetries attempts" }
     if ($response.StatusCode -eq 200) { return }
     if ($response.StatusCode -ne 202) { throw "DataAgent definition update returned HTTP $($response.StatusCode)" }
 
@@ -421,7 +450,16 @@ function Update-DataAgentDefinition {
     for ($attempt = 1; $attempt -le 60; $attempt++) {
         Start-Sleep 5
         $headers.Authorization = "Bearer $(Get-FabricAccessToken)"
-        $operation = Invoke-RestMethod -Uri $location -Headers $headers -Method GET -TimeoutSec 120 -ErrorAction Stop
+        try {
+            $operation = Invoke-RestMethod -Uri $location -Headers $headers -Method GET -TimeoutSec 120 -ErrorAction Stop
+        } catch {
+            $sc = $null; try { $sc = [int]$_.Exception.Response.StatusCode } catch {}
+            if ((Test-TransientNetworkError $_) -or ($sc -in @(408, 429, 500, 502, 503, 504))) {
+                Write-Host "    updateDefinition poll transient error — retrying..." -ForegroundColor DarkYellow
+                continue
+            }
+            throw
+        }
         if ($operation.status -eq "Succeeded") { return }
         if ($operation.status -eq "Failed") { throw "DataAgent definition update failed: $($operation.error.message)" }
     }
@@ -518,10 +556,11 @@ function Deploy-DataAgent {
         Write-Host "  ✓ Definition applied successfully" -ForegroundColor Green
     } catch {
         $errBody = $_.ErrorDetails.Message
+        if ([string]::IsNullOrWhiteSpace($errBody)) { $errBody = $_.Exception.Message }
         Write-Host "  ⚠ Definition update failed: $errBody" -ForegroundColor Yellow
         Write-Host "    The agent was created but may need manual configuration." -ForegroundColor Yellow
         Write-Host "    Open it in Fabric portal to add datasources." -ForegroundColor Yellow
-        throw "Definition update failed for Data Agent '$Name'"
+        throw "Definition update failed for Data Agent '$Name': $errBody"
     }
     Write-Host "  Publishing Data Agent staging configuration..." -ForegroundColor White
     try {
@@ -862,7 +901,7 @@ TelemetryRaw
 
     # --- Build data sources ---
     $kqlDatasourceJson = (@{
-        '$schema'              = "1.0.0"
+        '$schema'              = "https://developer.microsoft.com/json-schemas/fabric/item/dataAgent/definition/dataSource/1.0.0/schema.json"
         artifactId             = $kqlDbId
         workspaceId            = $workspaceId
         displayName            = $kqlDbDisplayName
@@ -873,12 +912,12 @@ TelemetryRaw
     } | ConvertTo-Json -Depth 10)
 
     $kqlFewShotsJson = (@{
-        '$schema' = "1.0.0"
+        '$schema' = "https://developer.microsoft.com/json-schemas/fabric/item/dataAgent/definition/fewShots/1.0.0/schema.json"
         fewShots  = $p360FewShots
     } | ConvertTo-Json -Depth 10)
 
     $lhDatasourceJson = (@{
-        '$schema'              = "1.0.0"
+        '$schema'              = "https://developer.microsoft.com/json-schemas/fabric/item/dataAgent/definition/dataSource/1.0.0/schema.json"
         artifactId             = $silverLhId
         workspaceId            = $workspaceId
         displayName            = $silverLhName
@@ -888,7 +927,7 @@ TelemetryRaw
         elements               = $lakehouseElements
     } | ConvertTo-Json -Depth 20)
 
-    $lhFewShotsJson = (@{ '$schema' = "1.0.0"; fewShots = $lhFewShots } | ConvertTo-Json -Depth 10)
+    $lhFewShotsJson = (@{ '$schema' = "https://developer.microsoft.com/json-schemas/fabric/item/dataAgent/definition/fewShots/1.0.0/schema.json"; fewShots = $lhFewShots } | ConvertTo-Json -Depth 10)
 
     $p360DataSources = @(
         @{ FolderName = "kusto-$kqlDbDisplayName";          DatasourceJson = $kqlDatasourceJson; FewShotsJson = $kqlFewShotsJson },
@@ -1182,7 +1221,7 @@ TelemetryRaw
 
     # --- Build data sources ---
     $kqlDatasourceJson = (@{
-        '$schema'              = "1.0.0"
+        '$schema'              = "https://developer.microsoft.com/json-schemas/fabric/item/dataAgent/definition/dataSource/1.0.0/schema.json"
         artifactId             = $kqlDbId
         workspaceId            = $workspaceId
         displayName            = $kqlDbDisplayName
@@ -1193,12 +1232,12 @@ TelemetryRaw
     } | ConvertTo-Json -Depth 10)
 
     $kqlFewShotsJson = (@{
-        '$schema' = "1.0.0"
+        '$schema' = "https://developer.microsoft.com/json-schemas/fabric/item/dataAgent/definition/fewShots/1.0.0/schema.json"
         fewShots  = $triageFewShots
     } | ConvertTo-Json -Depth 10)
 
     $lhDatasourceJson = (@{
-        '$schema'              = "1.0.0"
+        '$schema'              = "https://developer.microsoft.com/json-schemas/fabric/item/dataAgent/definition/dataSource/1.0.0/schema.json"
         artifactId             = $silverLhId
         workspaceId            = $workspaceId
         displayName            = $silverLhName
@@ -1208,7 +1247,7 @@ TelemetryRaw
         elements               = $lakehouseElements
     } | ConvertTo-Json -Depth 20)
 
-    $lhFewShotsJson = (@{ '$schema' = "1.0.0"; fewShots = $lhFewShots } | ConvertTo-Json -Depth 10)
+    $lhFewShotsJson = (@{ '$schema' = "https://developer.microsoft.com/json-schemas/fabric/item/dataAgent/definition/fewShots/1.0.0/schema.json"; fewShots = $lhFewShots } | ConvertTo-Json -Depth 10)
 
     $triageDataSources = @(
         @{ FolderName = "kusto-$kqlDbDisplayName";          DatasourceJson = $kqlDatasourceJson; FewShotsJson = $kqlFewShotsJson },
