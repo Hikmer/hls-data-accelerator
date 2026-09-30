@@ -129,6 +129,14 @@ ENV/
 env.bak/
 venv.bak/
 
+# The uppercase "ENV/" rule above re-ignores the lowercase src/**/env/ Python
+# packages on case-insensitive filesystems (Windows/macOS), undoing the
+# "!src/**/env/" intent and dropping DTT config_files_models/env modules.
+# Re-include those package directories and their contents explicitly (must come
+# after every env-ignoring rule to win the last-match).
+!src/**/env/
+!src/**/env/**
+
 # Spyder project settings
 .spyderproject
 .spyproject
