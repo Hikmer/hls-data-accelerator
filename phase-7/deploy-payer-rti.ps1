@@ -21,6 +21,10 @@ param (
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
+# Force UTF-8 for the Azure CLI (Python) so streamed build/log output does not crash with a
+# Windows cp1252 'charmap' UnicodeEncodeError on non-ASCII characters (e.g. during az acr build).
+$env:PYTHONUTF8 = '1'
+
 $ScriptRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 $RepoRoot = Split-Path -Parent $ScriptRoot
 $script:AccessTokenCache = @{}
@@ -114,7 +118,7 @@ function Get-AcrImageMetadata {
         [Parameter(Mandatory)][string]$Tag
     )
 
-    $raw = az acr manifest list-metadata --registry $Registry --name $Repository --query "[?tags[?contains(@, '$Tag')]][0].{digest:digest, createdTime:createdTime, lastUpdateTime:lastUpdateTime}" -o json 2>$null
+    $raw = az acr repository show --name $Registry --image "${Repository}:${Tag}" --query "{digest:digest, createdTime:createdTime, lastUpdateTime:lastUpdateTime}" -o json 2>$null
     if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($raw) -or $raw -eq "null") { return $null }
     return $raw | ConvertFrom-Json
 }
@@ -149,7 +153,7 @@ function Invoke-AcrBuildWithTagVerification {
     $before = Get-AcrImageMetadata -Registry $Registry -Repository $Repository -Tag $Tag
     $previousDigest = if ($before) { $before.digest } else { $null }
     $startedUtc = (Get-Date).ToUniversalTime()
-    az acr build --registry $Registry --image "${Repository}:${Tag}" $ContextPath
+    az acr build --registry $Registry --image "${Repository}:${Tag}" --no-logs $ContextPath
     $buildExitCode = $LASTEXITCODE
     if ($buildExitCode -eq 0) { return }
 
@@ -587,11 +591,14 @@ function Deploy-DataAgent {
 function New-KqlDatasource {
     param([string]$DisplayName, [string]$KqlDbId, [string]$WorkspaceId, [array]$Elements, [array]$FewShots, [string]$Instructions, [string[]]$Functions = @())
     $datasourceElements = @($Elements)
-    if ($Functions.Count -gt 0) {
-        $datasourceElements += @{ id = [guid]::NewGuid().ToString(); display_name = 'Functions'; type = 'kusto.functions'; is_selected = $true; children = @() }
-    }
+    # NOTE: A hand-built 'Functions' element (type kusto.functions / kusto.function) is rejected by
+    # the Fabric Data Agent datasource schema ("Required import part '.../datasource.json' contains
+    # invalid JSON"), and Fabric does not hydrate KQL functions into the element tree either. KQL
+    # helper functions are therefore grounded through the agent instructions and few-shot examples
+    # rather than datasource element selection (see phase-2/deploy-data-agents.ps1 for the same
+    # constraint). $Functions is accepted for call-site compatibility but not turned into elements.
     $datasourceJson = (@{
-        '$schema' = "1.0.0"
+        '$schema' = "https://developer.microsoft.com/json-schemas/fabric/item/dataAgent/definition/dataSource/1.0.0/schema.json"
         artifactId = $KqlDbId
         workspaceId = $WorkspaceId
         displayName = $DisplayName
@@ -600,9 +607,9 @@ function New-KqlDatasource {
         dataSourceInstructions = $Instructions
         elements = $datasourceElements
     } | ConvertTo-Json -Depth 20)
-    $fewShotsJson = (@{ '$schema' = "1.0.0"; fewShots = $FewShots } | ConvertTo-Json -Depth 20)
+    $fewShotsJson = (@{ '$schema' = "https://developer.microsoft.com/json-schemas/fabric/item/dataAgent/definition/fewShots/1.0.0/schema.json"; fewShots = $FewShots } | ConvertTo-Json -Depth 20)
     $selectedTables = @($Elements | Where-Object { [string]$_.type -eq 'kusto.table' } | ForEach-Object { [string]$_.display_name })
-    return @{ FolderName = "kusto-$DisplayName"; DatasourceId = $KqlDbId; DatasourceJson = $datasourceJson; FewShotsJson = $fewShotsJson; SelectionKind = 'kusto'; SelectedTables = $selectedTables; SelectedFunctions = @($Functions) }
+    return @{ FolderName = "kusto-$DisplayName"; DatasourceId = $KqlDbId; DatasourceJson = $datasourceJson; FewShotsJson = $fewShotsJson; SelectionKind = 'kusto'; SelectedTables = $selectedTables; SelectedFunctions = @() }
 }
 
 function New-LakehouseDatasource {
@@ -611,7 +618,7 @@ function New-LakehouseDatasource {
         @{ display_name = 'dbo'; type = 'lakehouse_tables.schema'; is_selected = $true; children = @($Tables | ForEach-Object { @{ display_name = $_; type = 'lakehouse_tables.table'; is_selected = $true } }) }
     )
     $datasourceJson = (@{
-        '$schema' = "1.0.0"
+        '$schema' = "https://developer.microsoft.com/json-schemas/fabric/item/dataAgent/definition/dataSource/1.0.0/schema.json"
         artifactId = $LakehouseId
         workspaceId = $WorkspaceId
         displayName = $DisplayName
@@ -620,8 +627,13 @@ function New-LakehouseDatasource {
         dataSourceInstructions = $Instructions
         elements = $elements
     } | ConvertTo-Json -Depth 30)
-    $fewShotsJson = (@{ '$schema' = "1.0.0"; fewShots = $FewShots } | ConvertTo-Json -Depth 20)
-    return @{ FolderName = "lakehouse_tables-$DisplayName"; DatasourceJson = $datasourceJson; FewShotsJson = $fewShotsJson; SelectionKind = 'lakehouse'; SelectedTables = @($Tables) }
+    $fewShotsJson = (@{ '$schema' = "https://developer.microsoft.com/json-schemas/fabric/item/dataAgent/definition/fewShots/1.0.0/schema.json"; fewShots = $FewShots } | ConvertTo-Json -Depth 20)
+    # Fabric normalizes the datasource folder prefix from the 'lakehouse_tables' type to
+    # 'lakehouse-tables' (hyphen) when it stores the definition. Emit the hyphen form up front so
+    # the hydrated-definition lookups in Repair/Assert-DataAgentTableSelection resolve (the working
+    # cohort agent uses the same 'lakehouse-tables-<name>' convention). The datasource 'type' value
+    # itself remains 'lakehouse_tables' (underscore) as required by the schema.
+    return @{ FolderName = "lakehouse-tables-$DisplayName"; DatasourceJson = $datasourceJson; FewShotsJson = $fewShotsJson; SelectionKind = 'lakehouse'; SelectedTables = @($Tables); SelectedFunctions = @() }
 }
 
 function New-OntologyDatasourceIfAvailable {
@@ -641,7 +653,7 @@ function New-OntologyDatasourceIfAvailable {
             @{ id = $_; is_selected = $true; display_name = $_; type = 'ontology.entity'; description = $null; children = @() }
         })
         $datasourceJson = (@{
-            '$schema'              = "1.0.0"
+            '$schema'              = "https://developer.microsoft.com/json-schemas/fabric/item/dataAgent/definition/dataSource/1.0.0/schema.json"
             artifactId             = $ontology.id
             workspaceId            = $WorkspaceId
             displayName            = $OntologyName
@@ -650,7 +662,7 @@ function New-OntologyDatasourceIfAvailable {
             dataSourceInstructions = $Instructions
             elements               = $elements
         } | ConvertTo-Json -Depth 20)
-        $fewShotsJson = (@{ '$schema' = "1.0.0"; fewShots = $FewShots } | ConvertTo-Json -Depth 20)
+        $fewShotsJson = (@{ '$schema' = "https://developer.microsoft.com/json-schemas/fabric/item/dataAgent/definition/fewShots/1.0.0/schema.json"; fewShots = $FewShots } | ConvertTo-Json -Depth 20)
         return @{ FolderName = "ontology-$OntologyName"; DatasourceJson = $datasourceJson; FewShotsJson = $fewShotsJson }
     } catch {
         Write-Host "  ⚠ Could not attach ontology datasource '$OntologyName': $(Get-ErrorMessage $_)" -ForegroundColor Yellow
@@ -980,18 +992,30 @@ if (-not $SkipPayerRti) {
         Invoke-AcrBuildWithTagVerification -Registry $acrName -Repository "claim-emulator" -Tag $claimImageTag -ContextPath "phase-7/claim-emulator"
         $claimImageDigest = az acr manifest show-metadata --registry $acrName --name "claim-emulator:$claimImageTag" --query digest -o tsv 2>$null
         if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($claimImageDigest)) { throw "Could not resolve immutable claim-emulator image digest" }
-        $resourceTagsJson = if ($Tags.Count -gt 0) { $Tags | ConvertTo-Json -Compress } else { '{}' }
-        $deploymentParams = @(
-            "acrName=$acrName",
-            "imageName=$acrLoginServer/claim-emulator@$claimImageDigest",
-            "eventHubName=claim-stream",
-            "eventHubNamespace=$EventHubNamespace",
-            "eventRatePerMinute=$ClaimEventRatePerMinute",
-            "resourceTags=$resourceTagsJson"
-        )
+        # Build an ARM parameters file. Passing an object parameter (resourceTags) inline as
+        # KEY={"k":"v"} is mangled by the Windows cmd/az quoting layer ("Failed to parse string
+        # as JSON"); a parameters file avoids all command-line JSON quoting problems.
+        $claimParamsObj = @{
+            '$schema'      = "https://schema.management.azure.com/schemas/2019-04-01/deploymentParameters.json#"
+            contentVersion = "1.0.0.0"
+            parameters     = @{
+                acrName            = @{ value = $acrName }
+                imageName          = @{ value = "$acrLoginServer/claim-emulator@$claimImageDigest" }
+                eventHubName       = @{ value = "claim-stream" }
+                eventHubNamespace  = @{ value = $EventHubNamespace }
+                eventRatePerMinute = @{ value = $ClaimEventRatePerMinute }
+                resourceTags       = @{ value = $Tags }
+            }
+        }
+        $claimParamsFile = Join-Path ([System.IO.Path]::GetTempPath()) "claim-emulator-params-$claimImageTag.json"
+        [System.IO.File]::WriteAllText($claimParamsFile, ($claimParamsObj | ConvertTo-Json -Depth 10), (New-Object System.Text.UTF8Encoding($false)))
         Write-Host "  Deploying claim-emulator-grp..." -ForegroundColor White
-        az deployment group create --resource-group $ResourceGroupName --name claim-emulator --template-file "bicep/claim-emulator.bicep" --parameters @deploymentParams | Out-Null
-        if ($LASTEXITCODE -ne 0) { throw "claim-emulator deployment failed" }
+        try {
+            az deployment group create --resource-group $ResourceGroupName --name claim-emulator --template-file "bicep/claim-emulator.bicep" --parameters "@$claimParamsFile" | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw "claim-emulator deployment failed" }
+        } finally {
+            Remove-Item $claimParamsFile -Force -ErrorAction SilentlyContinue
+        }
         if ($Tags.Count -gt 0) {
             $containerGroupId = az container show --resource-group $ResourceGroupName --name claim-emulator-grp --query id -o tsv
             $tagUpdateArgs = @()
@@ -1103,8 +1127,13 @@ if (-not $SkipPayerRti) {
 }
 '@
     if (-not (Invoke-KustoMgmt -Command $operationsFreshness -Label "fn_OperationsFreshness" @kqlParams)) { throw "fn_OperationsFreshness deployment failed" }
-    . (Join-Path $PSScriptRoot 'agent-grounding-backfills.ps1')
-    Invoke-AgentGroundingBackfills @kqlParams
+    $groundingScript = Join-Path $PSScriptRoot 'agent-grounding-backfills.ps1'
+    if (Test-Path $groundingScript) {
+        . $groundingScript
+        Invoke-AgentGroundingBackfills @kqlParams
+    } else {
+        Write-Host "  ⚠ agent-grounding-backfills.ps1 not found — skipping optional agent grounding backfills." -ForegroundColor Yellow
+    }
 
 
     if ($SkipSnapshotMaterialization) {
