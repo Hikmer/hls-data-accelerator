@@ -4,12 +4,14 @@ import base64
 import requests
 import time
 import subprocess
+import shutil
 import argparse
 
 def get_fabric_token():
-    res = subprocess.run(["az", "account", "get-access-token", "--resource", "https://api.fabric.microsoft.com", "-o", "json"], capture_output=True, text=True)
+    az = shutil.which("az") or "az"
+    res = subprocess.run([az, "account", "get-access-token", "--resource", "https://api.fabric.microsoft.com", "-o", "json"], capture_output=True, text=True)
     if res.returncode != 0:
-        raise RuntimeError("Failed to get az token")
+        raise RuntimeError(f"Failed to get az token: {res.stderr.strip()}")
     return json.loads(res.stdout)["accessToken"]
 
 def wait_for_lro(loc, headers):
@@ -234,15 +236,30 @@ def main():
         if loc:
             job_id = loc.split('/')[-1]
             loc = f"https://api.fabric.microsoft.com/v1/workspaces/{ws_id}/graphModels/{graph_id}/jobs/instances/{job_id}"
-            while True:
+            deadline = time.time() + 20 * 60
+            while time.time() < deadline:
                 time.sleep(5)
-                op = requests.get(loc, headers=headers).json()
-                if op["status"] in ["Completed", "Succeeded"]:
+                try:
+                    op = requests.get(loc, headers=headers, timeout=60).json()
+                except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
+                    # Transient network blip (e.g. WinError 10054). Retry rather than crash.
+                    print("Refresh poll transient error, retrying:", type(e).__name__)
+                    continue
+                status = op.get("status")
+                if status in ["Completed", "Succeeded"]:
                     print("Graph refresh completed.")
                     break
-                if op["status"] in ["Failed", "Cancelled"]:
-                    raise RuntimeError(f"Refresh job failed: {op['status']}")
-                print("Refresh status:", op["status"])
+                if status == "Deduped":
+                    # An identical refresh is already running (from an earlier trigger). The graph
+                    # definition is populated and a refresh is in flight/complete, so treat this as
+                    # success rather than polling the dedup pointer forever.
+                    print("Graph refresh deduped into an existing running job — graph is being refreshed.")
+                    break
+                if status in ["Failed", "Cancelled"]:
+                    raise RuntimeError(f"Refresh job failed: {status}")
+                print("Refresh status:", status)
+            else:
+                print("Graph refresh still running after 20 minutes — continuing (verify in the Fabric portal).")
     else:
         raise RuntimeError(f"Failed to start refresh: {r.status_code} {r.text}")
 

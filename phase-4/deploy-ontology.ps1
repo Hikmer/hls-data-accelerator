@@ -712,6 +712,7 @@ Write-Host "  ✓ Graph refresh invoked" -ForegroundColor Green
 
 $daStart = Get-Date
 $refreshCompleted = $false
+$refreshTerminalStatus = $null
 while ((New-TimeSpan -Start $daStart).TotalMinutes -lt 15) {
     Start-Sleep 15
     try {
@@ -726,20 +727,29 @@ while ((New-TimeSpan -Start $daStart).TotalMinutes -lt 15) {
         }
         throw $_
     }
-    if ($daJobs -and $daJobs[0].status -eq 'Completed') {
+    $curStatus = if ($daJobs) { $daJobs[0].status } else { $null }
+    if ($curStatus -eq 'Completed') {
         Write-Host "  ✓ Graph hydration completed successfully" -ForegroundColor Green
         $refreshCompleted = $true
         break
-    } elseif ($daJobs -and $daJobs[0].status -eq 'Failed') {
-        $errJson = $daJobs[0] | ConvertTo-Json -Depth 10
-        throw "Graph hydration failed: $errJson"
+    } elseif ($curStatus -in @('Failed', 'Cancelled', 'Deduped')) {
+        # Terminal, non-success. Stop polling immediately instead of waiting out the 15-min window.
+        $refreshTerminalStatus = $curStatus
+        break
     } else {
-        $statusStr = if ($daJobs) { $daJobs[0].status } else { "Unknown" }
+        $statusStr = if ($curStatus) { $curStatus } else { "Unknown" }
         Write-Host "    Status: $statusStr..." -ForegroundColor DarkGray
     }
 }
 if (-not $refreshCompleted) {
-    throw "Graph hydration did not complete within 15 minutes"
+    # Graph hydration is a known Fabric IQ (preview) limitation — see docs/BACKLOG.md,
+    # "Ontology graph models fail Refresh (GraphNotRefreshable)". The auto-generated GraphModel
+    # companion is an empty shell (graphType.json nodeTypes/edgeTypes = []) and there is currently
+    # no REST API to materialize the graph, so RefreshGraph cancels/fails within seconds. This is
+    # non-blocking: the Data Agents ground on the ontology vocabulary and query the Lakehouse/KQL
+    # directly. Warn and continue — refreshing the graph model is a manual Fabric portal step.
+    $reason = if ($refreshTerminalStatus) { "returned status '$refreshTerminalStatus'" } else { "did not complete within 15 minutes" }
+    Write-Host "  ⚠ Graph hydration $reason — continuing (known Fabric IQ preview limitation; refresh the graph model manually in the Fabric portal). See docs/BACKLOG.md." -ForegroundColor Yellow
 }
 
 Write-Host ""

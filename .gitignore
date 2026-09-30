@@ -94,3 +94,6 @@ repo-overview-video/
 
 # Generated Microsoft HDS source-deployment stage
 .hds-build/
+
+# GraphModel definition backups written by phase-4/deploy-graph-model.py at runtime
+.graph_backup_*.json
